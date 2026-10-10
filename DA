@@ -880,10 +880,93 @@ function Speed.Restore()
         end)
     end
     Speed.Humanoid, Speed.Base, Speed.Applied = nil, nil, nil
-    Speed.Owned = false
+    Speed.Owned, Speed.Mode = false, nil
+end
+function Speed.ClearRescue(token)
+    local travel = Speed.RescueTravel
+    if token ~= nil and (not travel or travel.token ~= token) then return false end
+    Speed.RescueTravel = nil
+    if Speed.Mode == "rescue" then Speed.Restore() end
+    return true
+end
+function Speed.BeginRescue(token, info)
+    if type(token) ~= "table" or token.owner ~= "rescue" then return false end
+    local owner, trig = info and info.owner, info and info.trig
+    if not owner or owner == LocalPlayer or owner.Parent ~= Players or not trig or not trig.Parent then return false end
+    local ownerCharacter = owner.Character
+    if not ownerCharacter then return false end
+    local travel = Speed.RescueTravel
+    if travel and travel.token == token and travel.info == info and travel.character == LocalPlayer.Character then
+        return true
+    end
+    local torso = trig:FindFirstChild("CapturedTorso")
+    local occupant = torso and torso:IsA("ObjectValue") and torso.Value
+    if not occupant or occupant:FindFirstAncestorOfClass("Model") ~= ownerCharacter then return false end
+    Speed.ClearRescue()
+    Speed.RescueTravel = {
+        token = token,
+        info = info,
+        torso = torso,
+        occupant = occupant,
+        owner = owner,
+        ownerCharacter = ownerCharacter,
+        ownerHumanoid = ownerCharacter:FindFirstChildOfClass("Humanoid"),
+        character = LocalPlayer.Character,
+        health = FH.Stat(owner, FH.HP),
+    }
+    return true
+end
+function Speed.RescueActive(hum)
+    local travel = Speed.RescueTravel
+    if not travel then return false end
+    if
+        unloaded
+        or travel.character ~= LocalPlayer.Character
+        or travel.owner.Parent ~= Players
+        or travel.owner.Character ~= travel.ownerCharacter
+        or travel.ownerHumanoid and (travel.ownerHumanoid.Parent ~= travel.ownerCharacter or travel.ownerHumanoid.Health <= 0)
+        or not travel.info.trig.Parent
+        or travel.torso.Parent ~= travel.info.trig
+        or travel.torso.Value ~= travel.occupant
+        or travel.health and (not travel.health.Parent or travel.health.Value <= 0)
+        or not FH.MotionValid(travel.token)
+    then
+        Speed.ClearRescue(travel.token)
+        return false
+    end
+    local motion = FH.Motion
+    if
+        not hum
+        or hum.Parent ~= travel.character
+        or hum.Health <= 0
+        or hum.Sit
+        or hum.PlatformStand
+        or Ctl.On()
+        or Fly.Active
+        or EM.ComboState
+        or UserInputService:GetFocusedTextBox()
+        or AR.Held
+        or AR.KeyDown
+        or Follow.Held
+        or Follow.KeyDown
+        or TR.Held
+        or TR.KeyDown
+        or AH.Down()
+        or FH.IsHacking(travel.token)
+        or motion.token ~= travel.token
+        or motion.hum ~= hum
+        or not motion.aim
+        or not FH.MotionActive()
+        or not hum.RootPart
+    then
+        return false
+    end
+    local delta = motion.aim - hum.RootPart.Position
+    return delta.X * delta.X + delta.Z * delta.Z > 0.64
 end
 function Speed.Step(hum)
-    if not speedActive or Speed.Level == 0 then
+    local mode = speedActive and Speed.Level > 0 and "fast" or Speed.RescueActive(hum) and "rescue"
+    if not mode then
         Speed.Restore()
         return
     end
@@ -895,22 +978,23 @@ function Speed.Step(hum)
     if not hum then return end
     local current = hum.WalkSpeed
     if Speed.Applied == nil or math.abs(current - Speed.Applied) >= 0.0001 then Speed.Base = current end
-    -- The small boost follows the game's own speed, including slows and a stop at 0.
-    local target = Speed.Level == 1 and math.max(0, Speed.Base) * Speed.LightScale or Speed.Run
+    -- AutoHelp's small boost follows game-written slows and a stop at zero.
+    -- Manual Fast keeps priority over the temporary rescue boost.
+    local target = mode == "rescue" and math.max(0, Speed.Base) * Speed.LightScale or Speed.Run
     if math.abs(current - target) >= 0.0001 then hum.WalkSpeed = target end
-    Speed.Applied, Speed.Owned = target, true
+    Speed.Applied, Speed.Owned, Speed.Mode = target, true, mode
 end
+TrackConnection(LocalPlayer.CharacterRemoving:Connect(function()
+    Speed.ClearRescue()
+    Speed.Restore()
+end))
 
 local function ToggleSpeed()
     if EM.ComboState then EM.Stop() end
-    Speed.Level = (Speed.Level + 1) % 3
+    Speed.Level = (Speed.Level + 1) % 2
     speedActive = Speed.Level > 0
     SetOn(Btn.Speed, speedActive)
-    if Btn.Speed then
-        Btn.Speed.Text = Speed.Level == 1 and "Speed: Light [C]"
-            or Speed.Level == 2 and "Speed: Fast [C]"
-            or "Speed [C]"
-    end
+    if Btn.Speed then Btn.Speed.Text = speedActive and "Speed: Fast [C]" or "Speed [C]" end
     Speed.Step(GetHumanoid())
 end
 local function ToggleInfJump()
@@ -2545,6 +2629,19 @@ function FH.RecoveryAim(token, hum, goal, intentGoal)
     -- Vertical bouncing does not restart the horizontal stall timer. Keep the
     -- committed destination during a jump, then check its lane after landing.
     if hum.FloorMaterial == Enum.Material.Air then return state.escape or goal end
+    local stairFlight = FH.JumpFlight
+    if
+        stairFlight
+        and stairFlight.normal
+        and stairFlight.token == token
+        and stairFlight.hum == hum
+        and stairFlight.root == root
+        and now - stairFlight.t < 0.3
+    then
+        -- Let an accepted native stair hop take off before lateral recovery
+        -- changes its destination. Its normal flight timeout remains bounded.
+        return state.escape or goal
+    end
     local feetY = FH.Feet(hum, root)
     local function clear(point)
         local step = Flat(point - rp)
@@ -2709,6 +2806,7 @@ function FH.ReleaseMotion(token, stop)
             pcall(function() m.hum:MoveTo(root.Position) end)
         end
     end
+    if FH.StairWatch and FH.StairWatch.hum == m.hum then FH.StairWatch = nil end
     m.token, m.aim, m.hum, m.priority, m.untilAt, m.replanToken = nil, nil, nil, 0, 0, nil
     if FH.JumpFlight and FH.JumpFlight.token == token then FH.JumpFlight = nil end
     if FH.MoveWatch and FH.MoveWatch.token == token then FH.MoveWatch = nil end
@@ -2730,6 +2828,7 @@ function FH.ResetCaches(keep)
     FH.Jmp = nil
     FH.JumpFlight = nil
     FH.MotionProbe = nil
+    FH.StairWatch = nil
     FH.StallIntent = nil
     FH.StallCheckAt = nil
     if keep then return end
@@ -3427,6 +3526,9 @@ function FH.JumpMoveStep()
         or not root
         or hum.Health <= 0
         or hum.Sit
+        or (flight.normal and (hum.PlatformStand or EM.ComboState or UserInputService:GetFocusedTextBox() or FH.IsHacking(
+            flight.token
+        ) or FH.True(LocalPlayer, FH.CAP) or FH.True(LocalPlayer, FH.RAG) or (Follow.InputOwner == flight.token and (Follow.Held or Follow.KeyDown)) or AR.Held or AR.KeyDown or TR.Held or TR.KeyDown))
         or flight.hum ~= hum
         or flight.root ~= root
         or os.clock() - flight.t > 1.2
@@ -3499,7 +3601,110 @@ function FH.GroundMoveStep()
     local direction = Flat(motion.aim - root.Position)
     hum:Move(direction.Magnitude > 0.5 and direction.Unit or Vector3.new(0, 0, 0), false)
 end
+-- Share a short, verified uphill sample between navigation and the render
+-- recovery loop. Flat walking needs only the coarse profile and one floor ray.
+function FH.StairProbe(hum, root, aim)
+    local delta = Flat(aim - root.Position)
+    if delta.Magnitude <= 0.5 then return false end
+    local now, feetY = os.clock(), FH.Feet(hum, root)
+    local dir, reach = delta.Unit, math.min(delta.Magnitude, 3.4)
+    local state = FH.StairWatch
+    if
+        state
+        and state.hum == hum
+        and state.root == root
+        and state.filterAt == rayFilterAt
+        and now - state.at < 0.15
+        and Flat(root.Position - state.pos).Magnitude < 0.75
+        and math.abs(feetY - state.feetY) < 0.2
+        and math.abs(reach - state.reach) < 0.2
+        and dir:Dot(state.dir) > 0.99
+    then
+        return state.stairs, state.feetY
+    end
+    FH.RefreshFilter()
+    local kind = FH.MotionProfile(hum, root, aim, feetY, reach)
+    local stairs = kind == "stairs"
+    if kind == nil then
+        -- The final low riser may be below the lowest horizontal profile ray.
+        -- Confirm raised support before paying for the full stair/body trace.
+        local distance = math.min(reach, 1.3)
+        local point = root.Position + dir * distance
+        local floor = Workspace:Raycast(Vector3.new(point.X, feetY + 1.25, point.Z), Vector3.new(0, -2.3, 0), rayParams)
+        if floor and floor.Normal.Y > 0.6 and floor.Position.Y > feetY + 0.1 then
+            stairs = FH.StairLane(root.Position.X, root.Position.Z, dir, feetY, reach) ~= nil
+        end
+    end
+    if stairs then
+        stairs =
+            Follow.PlanClear(root.Position, root.Position + dir * reach, feetY, reach, nil, nil, FH.BodyRadius(root))
+    end
+    FH.StairWatch = {
+        hum = hum,
+        root = root,
+        filterAt = rayFilterAt,
+        at = now,
+        pos = root.Position,
+        feetY = feetY,
+        reach = reach,
+        dir = dir,
+        stairs = stairs,
+    }
+    return stairs, feetY
+end
+-- Supported upward stairs need repeated ordinary takeoffs, including when a
+-- single failed hop makes no progress. Steering continues in this same frame.
+function FH.StairJumpStep()
+    local motion = FH.Motion
+    if not motion or motion.token == nil or not motion.aim then return false end
+    local hum, root = GetHumanoid(), RootNow()
+    if
+        unloaded
+        or not hum
+        or not root
+        or motion.hum ~= hum
+        or hum.RootPart ~= root
+        or hum.Health <= 0
+        or hum.Sit
+        or hum.PlatformStand
+        or hum.FloorMaterial == Enum.Material.Air
+        or FH.JumpFlight
+        or FH.Jmp
+        or os.clock() - FH.LastJump < 0.55
+        or Ctl.On()
+        or Fly.Active
+        or EM.ComboState
+        or UserInputService:GetFocusedTextBox()
+        or not FH.MotionActive()
+        or FH.IsWorking(motion.token)
+        or FH.IsHacking(motion.token)
+        or FH.True(LocalPlayer, FH.CAP)
+        or FH.True(LocalPlayer, FH.RAG)
+        or (Follow.InputOwner == motion.token and (Follow.Held or Follow.KeyDown))
+        or AR.Held
+        or AR.KeyDown
+        or TR.Held
+        or TR.KeyDown
+    then
+        return false
+    end
+    local stairs, feetY = FH.StairProbe(hum, root, motion.aim)
+    if not stairs or not FH.NormalJump(hum) then return false end
+    -- This records steering/ground geometry only. It schedules no airborne
+    -- second jump and leaves the game's speed and jump properties untouched.
+    FH.JumpFlight = {
+        t = os.clock(),
+        hum = hum,
+        root = root,
+        token = motion.token,
+        airborne = false,
+        normal = true,
+        feetY = feetY,
+    }
+    return true
+end
 function FH.MotionStep()
+    FH.StairJumpStep()
     FH.StallJumpStep()
     FH.JumpMoveStep()
     FH.GroundMoveStep()
@@ -3903,17 +4108,26 @@ local STAIR_H = { 1.1, 1.6, 2.3, 3.6, Follow.BodyH - 0.15 }
 -- A long horizontal profile sees the upper risers of a staircase as one tall
 -- obstacle. Trace small supported steps with body/head clearance instead; a
 -- tree, closed door, unsupported ledge or low ceiling must still be rejected.
-function FH.StairLane(px, pz, dir, baseY, reach, settings)
+function FH.StairLane(px, pz, dir, baseY, reach, settings, spacing)
     if reach <= 0.1 or reach > 6.1 then return nil end
     local params = settings or rayParams
-    local count = math.max(1, math.ceil(reach / 0.55))
+    local count = math.max(1, math.ceil(reach / (spacing or 0.55)))
     local length, floorY, raised = reach / count, baseY, false
     for i = 1, count do
         local x, z = px + dir.X * length * i, pz + dir.Z * length * i
         local floor = Workspace:Raycast(Vector3.new(x, floorY + 1.25, z), Vector3.new(0, -2.3, 0), params)
-        if not floor or floor.Normal.Y <= 0.6 then return nil end
+        if not floor then
+            if not spacing then return FH.StairLane(px, pz, dir, baseY, reach, settings, 0.275) end
+            return nil
+        end
+        if floor.Normal.Y <= 0.6 then return nil end
         local nextY, rise = floor.Position.Y, floor.Position.Y - floorY
-        if rise > 1.05 or rise < -0.85 then return nil end
+        if rise > 1.05 or rise < -0.85 then
+            -- A coarse sample can cross two short treads at once. Refine once
+            -- before mistaking their combined rise for an unwalkable ledge.
+            if not spacing then return FH.StairLane(px, pz, dir, baseY, reach, settings, 0.275) end
+            return nil
+        end
         if rise > 0.05 then raised = true end
         local previous = Vector3.new(px + dir.X * length * (i - 1), floorY, pz + dir.Z * length * (i - 1))
         local shapeOK, blocked = false, nil
@@ -6269,12 +6483,15 @@ function Follow.PlanStep(token, hum, root, goal, feetY, state, rescueGoal)
     if not state.progressPos or Flat(rp - state.progressPos).Magnitude >= 0.8 then
         state.progressPos, state.progressAt = rp, now
     end
-    local flight = stable and FH.JumpFlight
+    local flight = FH.JumpFlight
     local airborne = flight
+        and (stable or flight.normal)
         and flight.hum == hum
         and flight.root == root
+        and (flight.token == nil or flight.token == token)
         and now - flight.t <= 1.2
         and hum.FloorMaterial == Enum.Material.Air
+    if airborne and flight.normal and flight.feetY then feetY = flight.feetY end
     if aim and not airborne and now - (state.progressAt or now) >= 1.2 then
         reject(aim)
         aim, state.aim = nil, nil
@@ -6934,17 +7151,54 @@ function Follow.WalkTo(token, getGoal, stopDist, abort, opts)
         return true
     end
     local function ownedFlight(hum, root, now)
-        if not stableFollow or hum.FloorMaterial ~= Enum.Material.Air then return false end
+        if hum.FloorMaterial ~= Enum.Material.Air then return false end
         local flight = FH.JumpFlight or FH.Jmp
         return flight ~= nil
+            and (stableFollow or flight.normal)
             and flight.hum == hum
             and flight.root == root
             and (flight.token == nil or flight.token == token)
             and now - flight.t <= 1.2
     end
     local function waypointJump(index, hum, root, now)
-        local accepted = FH.Jump(hum, true)
-        local pending = FH.Jmp
+        local normal = FH.JumpFlight
+        if
+            not (
+                normal
+                and normal.normal
+                and normal.hum == hum
+                and normal.root == root
+                and normal.token == token
+                and now - normal.t <= 1.2
+            )
+        then
+            normal = nil
+        end
+        local accepted = false
+        if not normal then
+            local stairs, feetY = false, nil
+            if hum.FloorMaterial ~= Enum.Material.Air and not EM.ComboState then
+                stairs, feetY = FH.StairProbe(hum, root, wps[index].Position)
+            end
+            if stairs then
+                accepted = FH.NormalJump(hum)
+                if accepted then
+                    FH.JumpFlight = {
+                        t = now,
+                        hum = hum,
+                        root = root,
+                        token = token,
+                        airborne = false,
+                        normal = true,
+                        feetY = feetY,
+                    }
+                    normal = FH.JumpFlight
+                end
+            else
+                accepted = FH.Jump(hum, true)
+            end
+        end
+        local pending = FH.Jmp or normal
         if stableFollow and not accepted and pending and jumpIndex and jumpIndex ~= index then return false end
         if accepted or (pending and pending.hum == hum and pending.root == root and now - pending.t <= 1.2) then
             jumpIndex = index
@@ -7215,6 +7469,9 @@ function Follow.WalkTo(token, getGoal, stopDist, abort, opts)
         FH.RefreshFilter()
         FH.Tick(hum, root)
         local flying = ownedFlight(hum, root, now)
+        if flying and FH.JumpFlight and FH.JumpFlight.normal and FH.JumpFlight.feetY then
+            feetY = FH.JumpFlight.feetY
+        end
         if stableFollow and hum.FloorMaterial ~= Enum.Material.Air then groundedFeetY = feetY end
         if jumpTraversal then
             local traversal = jumpTraversal
@@ -7786,7 +8043,7 @@ function FH.RescueJuke(tok, root, aim, podGoal, feetY)
     }
     return pick and pick.aim or aim
 end
-function FH.RescuePod(tok, alive, info, stopFn, hold, release)
+function FH.RescuePod(tok, alive, info, stopFn, hold, release, travel)
     local trig, ev = info.trig, info.ev
     local HR = Follow.HelpDist + 1.6
     local routeState = { rescueTarget = trig }
@@ -7818,6 +8075,11 @@ function FH.RescuePod(tok, alive, info, stopFn, hold, release)
             or not holds()
             or (stopFn ~= nil and stopFn())
     end
+    local function moving(value)
+        -- Releasing an old rescue hold lets the movement controller keep steering.
+        if value then release() end
+        if travel then travel(value) end
+    end
     local function reposition()
         local r = RootNow()
         if not r or stop() then return false end
@@ -7827,6 +8089,7 @@ function FH.RescuePod(tok, alive, info, stopFn, hold, release)
             -- Retry from another clear side, rather than walking into the pod's centre.
             if Flat(c.p - from).Magnitude >= 2.4 then
                 tried = tried + 1
+                moving(true)
                 Follow.WalkTo(
                     tok,
                     function() return c.p end,
@@ -7834,6 +8097,7 @@ function FH.RescuePod(tok, alive, info, stopFn, hold, release)
                     stop,
                     { maxTime = 4, nearOk = 1.8, rescueJuke = trig.Position }
                 )
+                moving(false)
                 local rr = RootNow()
                 if rr and Flat(rr.Position - from).Magnitude >= 1.2 then return true end
             end
@@ -7853,11 +8117,15 @@ function FH.RescuePod(tok, alive, info, stopFn, hold, release)
         Ctl.Gate()
 
         if not near() then
-            Follow.WalkTo(tok, function() return trig.Position end, 1.5, function()
-                if stop() then return true end
-                if flatDist() <= 9 and sees() then hold(ev, true) end
-                return near()
-            end, { maxTime = 14, nearOk = 2.5, rescueJuke = trig.Position, rescueSteer = routeState })
+            moving(true)
+            Follow.WalkTo(
+                tok,
+                function() return trig.Position end,
+                1.5,
+                function() return stop() or near() end,
+                { maxTime = 14, nearOk = 2.5, rescueJuke = trig.Position, rescueSteer = routeState }
+            )
+            moving(false)
             if stop() then
                 release()
                 return "stop"
@@ -7872,6 +8140,7 @@ function FH.RescuePod(tok, alive, info, stopFn, hold, release)
                     tried = tried + 1
                     -- WalkTo plans in the background while steering; do not wait for
                     -- another ComputeAsync here before starting the approach.
+                    moving(true)
                     Follow.WalkTo(
                         tok,
                         function() return c.p end,
@@ -7879,6 +8148,7 @@ function FH.RescuePod(tok, alive, info, stopFn, hold, release)
                         function() return stop() or near() end,
                         { maxTime = 10, nearOk = 3, rescueJuke = trig.Position, rescueSteer = routeState }
                     )
+                    moving(false)
                     if near() then
                         reached = true
                         break
@@ -7905,7 +8175,7 @@ function FH.RescuePod(tok, alive, info, stopFn, hold, release)
                     hold(ev)
                 else
                     lost = lost or os.clock()
-                    release()
+                    moving(true)
                     if hum then FH.Move(tok, hum, trig.Position) end
                     if os.clock() - lost > 1.2 then break end
                 end
@@ -8033,8 +8303,10 @@ function Follow.Chase(token, getGoal, stopDist, abort, keep)
         local sd = type(stopDist) == "function" and stopDist() or stopDist
         FH.RefreshFilter()
         FH.Tick(hum, root)
-        local jump = (stable and FH.JumpFlight) or FH.Jmp
+        local flight = FH.JumpFlight
+        local jump = (flight and (stable or flight.normal) and flight) or FH.Jmp
         local jumping = hum.FloorMaterial == Enum.Material.Air and jump and jump.hum == hum and jump.root == root
+        if jumping and jump.normal and jump.feetY then feetY = jump.feetY end
         local escaping = Follow.ActiveEscape(token, hum, root)
         if FH.Motion.replanToken == token and not escaping then return finish("trapped", false) end
         if
@@ -9298,7 +9570,7 @@ function AH.TapStep()
             ok = pcall(function() VIM:SendKeyEvent(true, Enum.KeyCode.E, false, game) end)
             if ok then backend = "vim" end
         end
-        AH.NextTapAt = now + (ok and 2 or 0.25)
+        AH.NextTapAt = now + (ok and 1 or 0.25)
         if ok then
             AH.TapDown, AH.TapUntil, AH.TapBackend = true, now + 0.06, backend
             AH.TapCharacter = LocalPlayer.Character
@@ -9958,6 +10230,7 @@ function AR.SetLabel()
     end
 end
 function AR.SetBusy(v)
+    if not v then Speed.ClearRescue() end
     if AR.BusyFlag ~= v then
         AR.BusyFlag = v
         AR.SetLabel()
@@ -9965,6 +10238,7 @@ function AR.SetBusy(v)
 end
 function AR.Hold(ev, remoteOnly, token)
     if Ctl.On() or (token and not FH.MotionAvailable(token)) then return false end
+    Speed.ClearRescue(token)
     if AH.ReleaseTap then AH.ReleaseTap() end
     if TR.Held or TR.KeyDown then TR.Release() end
     if Follow.Held or Follow.KeyDown then Follow.Release() end
@@ -9986,6 +10260,7 @@ function AR.Hold(ev, remoteOnly, token)
     end
 end
 function AR.Release(token)
+    Speed.ClearRescue(token)
     -- Cancellation cleanup may run after token.ok() became false; ownership suffices.
     if token ~= nil and AR.HoldToken ~= token then return false end
     local h, kd = AR.Held, AR.KeyDown
@@ -10108,14 +10383,21 @@ function AR.Nearest()
     AR.Pick, AR.PickAt = best, os.clock()
     return best
 end
-function AR.Rescue(tok, info)
+function AR.Rescue(tok, info, alive)
     local res = FH.RescuePod(
         tok,
-        function() return tok.ok() end,
+        alive or function() return tok.ok() end,
         info,
         nil,
         function(ev, remoteOnly) AR.Hold(ev, remoteOnly, tok) end,
-        function() AR.Release(tok) end
+        function() AR.Release(tok) end,
+        function(moving)
+            if moving then
+                Speed.BeginRescue(tok, info)
+            else
+                Speed.ClearRescue(tok)
+            end
+        end
     )
     if res == "far" then
         AR.Skip[info.trig] = os.clock() + 15
@@ -16391,11 +16673,7 @@ function AR.RequestPlayer(player)
                                 break
                             end
                         end
-                        if pod then
-                            FH.RescuePod(tok, runnable, pod, nil, function(ev, remoteOnly)
-                                if runnable() then AR.Hold(ev, remoteOnly, tok) end
-                            end, function() AR.Release(tok) end)
-                        end
+                        if pod then AR.Rescue(tok, pod, runnable) end
                     else
                         -- Follow a dragged, downed player; switch to their pod as soon as captured.
                         Follow.WalkTo(
@@ -16958,6 +17236,36 @@ EM.Groups = {
         { Name = "Barrel", Id = "136801964", Speed = 1, Looped = true },
         { Name = "Insane", Id = "33796059", Speed = 1e8, Looped = true },
     },
+    {
+        Name = "MORE",
+        {
+            Name = "Hug",
+            Layers = {
+                { Id = "126753849", Time = 1.00, Weight = 0.65 },
+                { Id = "35154961", Time = 1.63, Weight = 0.20 },
+            },
+        },
+        {
+            Name = "Suc",
+            Layers = {
+                { Id = "129967390", Time = 0.28, Weight = 1.00 },
+                { Id = "129423131", Time = 0.30, Weight = 0.75 },
+            },
+            Arm = { Id = "129967390", Speed = 8 },
+        },
+        {
+            Name = "Sword Pump Up",
+            Layers = { { Id = "85723345", Loop = true, Speed = 8, Weight = 1.00 } },
+        },
+        {
+            Name = "Nonchalant",
+            Layers = {
+                { Id = "129967390", Time = 0.22, Weight = 1.00 },
+                { Id = "33796059", Time = 3.03, Weight = 0.60 },
+            },
+        },
+        { Name = "Walk Loop", Layers = { { Id = "180426354", Loop = true, Weight = 1.00 } } },
+    },
 }
 -- Selecting Moving Dance from either category controls the same emote.
 EM.Groups[3][1] = EM.Groups[1][4]
@@ -17002,17 +17310,7 @@ function EM.RestoreCombo(state)
     if FH.PrioUntil == state.prioApplied then FH.PrioUntil = state.prioBefore end
     if state.motion then FH.ReleaseMotion(state.motion, true) end
 end
-function EM.Stop()
-    EM.Token = EM.Token + 1
-    EM.Disconnect("HoldConnection")
-    EM.Disconnect("StoppedConnection")
-    EM.Disconnect("DeathConnection")
-    local track, anim, state = EM.CurrentTrack, EM.CurrentAnimation, EM.ComboState
-    if state then state.restoreToken = EM.Token end
-    EM.CurrentTrack, EM.CurrentAnimation, EM.CurrentData, EM.ComboState = nil, nil, nil, nil
-    EM.Frozen = false
-    EM.RestoreCombo(state)
-    if state then state.restoreToken = nil end
+function EM.DisposeClip(track, anim)
     if track then
         pcall(function()
             track:AdjustSpeed(1)
@@ -17021,6 +17319,29 @@ function EM.Stop()
         pcall(function() track:Destroy() end)
     end
     if anim then pcall(function() anim:Destroy() end) end
+end
+function EM.Stop()
+    EM.Token = EM.Token + 1
+    EM.Disconnect("HoldConnection")
+    EM.Disconnect("StoppedConnection")
+    EM.Disconnect("DeathConnection")
+    local track, anim, state = EM.CurrentTrack, EM.CurrentAnimation, EM.ComboState
+    local layers = EM.LayerState
+    EM.LayerState = nil
+    if layers then
+        for _, connection in ipairs(layers.connections) do
+            pcall(function() connection:Disconnect() end)
+        end
+        for _, clip in ipairs(layers.clips) do
+            EM.DisposeClip(clip.track, clip.animation)
+        end
+    end
+    if state then state.restoreToken = EM.Token end
+    EM.CurrentTrack, EM.CurrentAnimation, EM.CurrentData, EM.ComboState = nil, nil, nil, nil
+    EM.Frozen = false
+    EM.RestoreCombo(state)
+    if state then state.restoreToken = nil end
+    EM.DisposeClip(track, anim)
     EM.Changed()
 end
 function EM.Animator(hum)
@@ -17042,8 +17363,8 @@ function EM.LoadTrack(animator, data)
     end
     local played = pcall(function()
         track.Looped = data.Looped
-        track.Priority = Enum.AnimationPriority.Action4
-        track:Play(0.15, 1, data.Speed)
+        track.Priority = data.Priority or Enum.AnimationPriority.Action4
+        track:Play(data.Fade or 0.15, math.max(data.Weight or 1, 0.001), data.Speed or 1)
     end)
     if not played then
         pcall(function() track:Stop(0) end)
@@ -17094,6 +17415,88 @@ function EM.Play(data)
         end)
     end
     EM.Changed()
+    return true
+end
+function EM.LayersValid(state)
+    return not unloaded
+        and EM.LayerState == state
+        and EM.Token == state.generation
+        and LocalPlayer.Character == state.character
+        and GetHumanoid() == state.hum
+        and state.hum.Parent == state.character
+        and state.hum.Health > 0
+end
+function EM.PlayLayer(state, animator, layer, fade, priority)
+    if not EM.LayersValid(state) then return false end
+    local track, anim = EM.LoadTrack(animator, {
+        Id = layer.Id,
+        Looped = layer.Loop == true,
+        Speed = layer.Speed or 1,
+        Weight = layer.Weight or 1,
+        Fade = fade,
+        Priority = priority,
+    })
+    if not track then return false end
+    if not EM.LayersValid(state) then
+        EM.DisposeClip(track, anim)
+        return false
+    end
+    -- Register before waiting for the asset, so toggling off or respawning
+    -- immediately stops every pose, including a layer that is still loading.
+    local clip = { track = track, animation = anim }
+    state.clips[#state.clips + 1] = clip
+    state.connections[#state.connections + 1] = track.Stopped:Connect(function()
+        if EM.LayersValid(state) then EM.Stop() end
+    end)
+    local started = os.clock()
+    while EM.LayersValid(state) and track.Length == 0 and os.clock() - started < 0.6 do
+        RunService.Heartbeat:Wait()
+    end
+    if not EM.LayersValid(state) then return false end
+    if track.Length == 0 then return false end
+    if not layer.Loop then
+        local ok = pcall(function()
+            track.TimePosition = math.clamp(layer.Time or 0, 0, math.max(track.Length - 0.01, 0))
+            track:AdjustSpeed(0)
+        end)
+        if not ok then return false end
+        EM.Frozen = true
+    end
+    return true
+end
+function EM.PlayLayers(data)
+    local hum = GetHumanoid()
+    local animator = EM.Animator(hum)
+    if not animator then
+        EM.LastError = "R6 character required"
+        EM.Changed()
+        return false
+    end
+    local state = { hum = hum, character = LocalPlayer.Character, generation = EM.Token, clips = {}, connections = {} }
+    EM.LayerState, EM.CurrentData, EM.LastError, EM.Frozen = state, data, nil, false
+    EM.WatchDeath(hum, state.generation)
+    EM.Changed()
+    task.spawn(function()
+        local ok, played = pcall(function()
+            local priority = data.Arm and Enum.AnimationPriority.Action3 or Enum.AnimationPriority.Action4
+            for i, layer in ipairs(data.Layers) do
+                if not EM.PlayLayer(state, animator, layer, i == 1 and 0.1 or 0.15, priority) then return false end
+            end
+            if data.Arm then
+                return EM.PlayLayer(state, animator, {
+                    Id = data.Arm.Id,
+                    Loop = true,
+                    Speed = data.Arm.Speed or 8,
+                }, 0.1, Enum.AnimationPriority.Action4)
+            end
+            return true
+        end)
+        if (not ok or not played) and EM.LayerState == state and EM.Token == state.generation then
+            EM.Stop()
+            EM.LastError = "Animation unavailable"
+            EM.Changed()
+        end
+    end)
     return true
 end
 function EM.ComboValid(state)
@@ -17225,6 +17628,7 @@ function EM.PlayCombo(data)
         EM.Changed()
         return false
     end
+    if Speed.ClearRescue then Speed.ClearRescue() end
     local state = {
         hum = hum,
         root = root,
@@ -17267,6 +17671,7 @@ function EM.Toggle(group, index)
     EM.LastError = nil
     if wasCurrent then return true end
     if data.Type == "Combo" then return EM.PlayCombo(data) end
+    if data.Layers then return EM.PlayLayers(data) end
     return EM.Play(data)
 end
 TrackConnection(LocalPlayer.CharacterRemoving:Connect(function() EM.Stop() end))
@@ -17439,7 +17844,7 @@ function EX.Refresh()
     EX.Extra.Visible = EX.Mode == "spectate"
     if EX.Mode == "emote" then
         local group = EM.Groups[EX.Group]
-        EX.Section.Text = group.Name .. " [" .. EX.Group .. "/4]  Q >"
+        EX.Section.Text = group.Name .. " [" .. EX.Group .. "/" .. #EM.Groups .. "]  Q >"
         for i, row in ipairs(EX.Rows) do
             local data = group[i]
             row.Visible = true
@@ -17762,7 +18167,7 @@ TrackConnection(RunService.Stepped:Connect(function(_, dt)
             end
         end
     end
-    if (speedActive or Speed.Owned) and not EM.OwnsWalk() then Speed.Step(GetHumanoid()) end
+    if (speedActive or Speed.Owned or Speed.RescueTravel) and not EM.OwnsWalk() then Speed.Step(GetHumanoid()) end
 end))
 TrackConnection(UserInputService.JumpRequest:Connect(function()
     if infJumpActive and not (FH.SpacePulse and FH.SpacePulse.ownedJump) and os.clock() >= (FH.OwnJumpUntil or 0) then
