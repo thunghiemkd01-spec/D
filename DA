@@ -2481,55 +2481,79 @@ function FH.StallJumpStep()
     state.jumped = true
     return true
 end
--- Measure actual progress even when a blocked MoveTo keeps renewing its lease.
--- The owning task issues the recovery move itself, so no second loop can fight it.
+-- Measure horizontal progress while the owning task keeps issuing movement.
+-- A failed jump commits one safe sideways lane before asking for a new route.
 function FH.RecoveryAim(token, hum, goal, intentGoal)
     local root = hum.RootPart
     local desired = intentGoal or goal
-    if not root or not desired or unloaded or Ctl.On() or Fly.Active or hum.Sit or FH.IsWorking(token) then
+    if
+        not root
+        or not desired
+        or unloaded
+        or hum.Health <= 0
+        or hum.Sit
+        or hum.PlatformStand
+        or Ctl.On()
+        or Fly.Active
+        or EM.ComboState
+        or UserInputService:GetFocusedTextBox()
+        or not FH.MotionAvailable(token)
+        or FH.True(LocalPlayer, FH.CAP)
+        or FH.True(LocalPlayer, FH.RAG)
+        or FH.IsWorking(token)
+        or FH.IsHacking(token)
+        or (Follow.InputOwner == token and (Follow.Held or Follow.KeyDown))
+        or AR.Held
+        or AR.KeyDown
+        or TR.Held
+        or TR.KeyDown
+    then
         FH.MoveWatch = nil
         return goal
     end
     local rp, now = root.Position, os.clock()
     local dv = Flat(desired - rp)
-    if
-        dv.Magnitude <= 2.5
-        and math.abs(desired.Y - rp.Y) <= Follow.MaxDY
-        and (type(token) ~= "number" or FH.ApproachClear(rp, desired))
-    then
+    if dv.Magnitude <= 0.8 and math.abs(desired.Y - rp.Y) <= Follow.MaxDY then
         FH.MoveWatch = nil
         return goal
     end
     local state = FH.MoveWatch
-    if not state or state.token ~= token or state.root ~= root or now - state.seen > 0.7 then
-        state = { token = token, root = root, anchor = rp, at = now, seen = now, lastSide = 1 }
+    if
+        not state
+        or state.token ~= token
+        or state.root ~= root
+        or state.hum ~= hum
+        or now - state.seen > 0.7
+        or (intentGoal and state.intentGoal and Flat(intentGoal - state.intentGoal).Magnitude > 6)
+    then
+        state = { token = token, root = root, hum = hum, anchor = rp, at = now, seen = now, lastSide = 1 }
         FH.MoveWatch = state
     end
     state.seen = now
+    if intentGoal then state.intentGoal = intentGoal end
     local attempted = Flat(goal - rp)
     if type(token) == "number" and attempted.Magnitude > 0.8 then
-        if state.dir and state.dir:Dot(attempted.Unit) < 0.65 and not state.turnGrace then
+        if state.dir and state.dir:Dot(attempted.Unit) < 0.65 and not state.turnGrace and not state.escape then
             state.turnGrace, state.graceUntil = true, now + 0.3
         end
         state.dir = attempted.Unit
-    end
-    -- Vertical takeoff is not forward progress, and recovery must wait for landing.
-    if hum.FloorMaterial == Enum.Material.Air then
-        state.anchor, state.at = rp, now
-        state.turnGrace, state.graceUntil = nil, nil
-        return goal
     end
     if Flat(rp - state.anchor).Magnitude >= 0.8 then
         state.anchor, state.at = rp, now
         state.turnGrace, state.graceUntil = nil, nil
     end
+    -- Vertical bouncing does not restart the horizontal stall timer. Keep the
+    -- committed destination during a jump, then check its lane after landing.
+    if hum.FloorMaterial == Enum.Material.Air then return state.escape or goal end
     local feetY = FH.Feet(hum, root)
     local function clear(point)
         local step = Flat(point - rp)
-        if step.Magnitude <= 1.2 then return false end
+        if step.Magnitude <= 0.8 then return true end
+        if FH.LaneRejected and FH.LaneRejected(rp, point, feetY) then return false end
         local dir, reach = step.Unit, math.min(step.Magnitude, 3.5)
         local across = Vector3.new(-dir.Z, 0, dir.X)
-        for _, off in ipairs({ 0, 0.75, -0.75 }) do
+        local radius = FH.BodyRadius(root)
+        for _, off in ipairs({ 0, radius * 0.5, -radius * 0.5, radius, -radius }) do
             local origin, floorY = rp + across * off, feetY
             for i = 0, 1 do
                 local floor, jump = FH.Seg(
@@ -2545,41 +2569,54 @@ function FH.RecoveryAim(token, hum, goal, intentGoal)
         end
         return true
     end
-    if not intentGoal then state.escape = nil end
+    local function replan(point)
+        if FH.Motion.token == token then FH.Motion.replanToken = token end
+        FH.BanDirect, FH.GridBan = math.max(FH.BanDirect or 0, now + 1.2), 0
+        if point and FH.RejectLane then FH.RejectLane(token, hum, point) end
+    end
     if state.escape then
-        if now < state.escapeUntil and Flat(state.escape - rp).Magnitude > 1 then
+        if Flat(rp - state.escapeAnchor).Magnitude >= 0.35 then
+            state.escapeAnchor, state.escapeAt = rp, now
+        end
+        if Flat(state.escape - rp).Magnitude <= 0.8 then
+            state.escape, state.escapeUntil = nil, nil
+            state.anchor, state.at = rp, now
+            replan(nil)
+            return goal
+        end
+        if now < state.escapeUntil and now - state.escapeAt < 0.7 then
             if now >= (state.escapeCheckAt or 0) then
-                state.escapeCheckAt = now + 0.1
+                state.escapeCheckAt = now + 0.25
+                FH.RefreshFilter()
                 state.escapeClear = clear(state.escape)
             end
             if state.escapeClear then return state.escape end
         end
-        state.escape = nil
+        local failed = state.escape
+        state.escape, state.escapeUntil = nil, nil
+        state.turnGrace, state.graceUntil = nil, nil
+        replan(failed)
+        -- A blocked side must not win the next pick just because its center
+        -- rays still pass. Mark it briefly and try the opposite side now.
+        if now - state.escapeAt >= 0.7 then FH.AddBad(failed, 4) end
+        state.at, state.anchor = now - 1.2, rp
     end
     if now - state.at < 1.2 or now < (state.graceUntil or 0) then return goal end
     state.at, state.anchor = now, rp
     state.turnGrace, state.graceUntil = nil, nil
-    local motion = FH.Motion
-    if motion.token == token then motion.replanToken = token end
-    FH.BanDirect, FH.GridBan = math.max(FH.BanDirect or 0, now + 1.2), 0
-    -- A planned waypoint owns its direction. Replan it instead of substituting
-    -- a side-step that could cut across the very wall the path avoids.
-    if not intentGoal then
-        if FH.RejectLane then FH.RejectLane(token, hum, goal) end
-        return goal
-    end
     FH.RefreshFilter()
     local forward = dv.Magnitude > 0.5 and dv or Flat(root.CFrame.LookVector)
     if forward.Magnitude < 0.1 then forward = Vector3.new(1, 0, 0) end
     forward = forward.Unit
     local side = Vector3.new(-forward.Z, 0, forward.X) * -state.lastSide
-    if dv.Magnitude > 0.5 then FH.AddBad(rp + forward * 3.2, 6) end
+    -- First walk sideways around trees/walls, instead of repeatedly jumping
+    -- into them. Probe a bounded set only when stalled, never each frame.
     local pick
     for _, dir in ipairs({
-        forward * 0.5 + side * 0.866,
-        forward * 0.5 - side * 0.866,
         side,
         -side,
+        forward * 0.5 + side * 0.866,
+        forward * 0.5 - side * 0.866,
         -forward * 0.5 + side * 0.866,
         -forward * 0.5 - side * 0.866,
         -forward,
@@ -2590,14 +2627,23 @@ function FH.RecoveryAim(token, hum, goal, intentGoal)
             break
         end
     end
-    if not pick then return goal end
+    if not pick then
+        replan(goal)
+        return goal
+    end
+    -- Keep this one destination through normal waypoint updates and jumping.
+    -- Replan after the detour finishes or fails, not before it can be walked.
+    if FH.RejectLane then FH.RejectLane(token, hum, goal) end
+    if dv.Magnitude > 0.5 then FH.AddBad(rp + forward * 3.2, 6) end
     state.lastSide = Flat(pick - rp):Dot(Vector3.new(-forward.Z, 0, forward.X)) >= 0 and 1 or -1
-    state.escape, state.escapeUntil = pick, now + 0.65
-    state.escapeCheckAt, state.escapeClear = now + 0.1, true
+    state.escape, state.escapeUntil = pick, now + 1.8
+    state.escapeAnchor, state.escapeAt = rp, now
+    state.escapeCheckAt, state.escapeClear = now + 0.25, true
     return pick
 end
 function FH.Move(token, hum, goal, force, intentGoal)
     if not (hum and goal) or hum.Health <= 0 or Ctl.On() or Fly.Active or not FH.MotionAvailable(token) then
+        if FH.MoveWatch and FH.MoveWatch.token == token then FH.MoveWatch = nil end
         return false
     end
     FH.NoteStallIntent(token, hum, goal, intentGoal)
@@ -2622,7 +2668,8 @@ function FH.Move(token, hum, goal, force, intentGoal)
         end
         return true
     end
-    if rejected(goal) then return false end
+    -- A rejected forward lane still needs its horizontal-progress watch;
+    -- recovery may safely choose a different lane before this final check.
     goal = FH.RecoveryAim(token, hum, goal, intentGoal)
     if rejected(goal) then return false end
     local m, now = FH.Motion, os.clock()
@@ -6018,8 +6065,20 @@ function Follow.PlanClear(rp, point, feetY, reachLimit, settings, ignoreBad, bod
 end
 -- Keep a committed clear lane while the planner yields, rather than rerolling
 -- a new side-step every few frames. Waypoints replace it when the path is ready.
+function Follow.ActiveEscape(token, hum, root)
+    local recovery = FH.MoveWatch
+    return recovery ~= nil
+        and recovery.token == token
+        and recovery.root == root
+        and recovery.hum == hum
+        and recovery.escape ~= nil
+        and os.clock() < (recovery.escapeUntil or 0)
+end
 function Follow.PlanStep(token, hum, root, goal, feetY, state, rescueGoal)
     if not TokOK(token) or Ctl.On() or Fly.Active then return false end
+    -- The shared motion controller validates the committed side lane. Probing
+    -- the old waypoint here would jump into or reject the original obstacle.
+    if Follow.ActiveEscape(token, hum, root) then return FH.Move(token, hum, goal) end
     local rp, now = root.Position, os.clock()
     local stable = type(token) == "number" and not rescueGoal
     local function clearLane(from, point, y, reach)
@@ -6069,7 +6128,7 @@ function Follow.PlanStep(token, hum, root, goal, feetY, state, rescueGoal)
         if #state.trail > 16 then table.remove(state.trail, 1) end
     end
     local aim = state.aim
-    if not state.progressPos or (rp - state.progressPos).Magnitude >= 0.8 then
+    if not state.progressPos or Flat(rp - state.progressPos).Magnitude >= 0.8 then
         state.progressPos, state.progressAt = rp, now
     end
     local flight = stable and FH.JumpFlight
@@ -6707,11 +6766,20 @@ function Follow.WalkTo(token, getGoal, stopDist, abort, opts)
         end
         clearPath()
         if FH.Motion.replanToken == token then FH.Motion.replanToken = nil end
-        if FH.MoveWatch and FH.MoveWatch.token == token then
-            if stableFollow then
-                FH.MoveWatch.escape, FH.MoveWatch.escapeUntil = nil, nil
-            else
-                FH.MoveWatch = nil
+        local recovery = FH.MoveWatch
+        if recovery and recovery.token == token then
+            -- A completed plan must not pull us back into the obstruction while
+            -- the owning controller is still crossing its verified side lane.
+            local keepEscape = recovery.root == root
+                and recovery.hum == hum
+                and recovery.escape ~= nil
+                and os.clock() < (recovery.escapeUntil or 0)
+            if not keepEscape then
+                if stableFollow then
+                    recovery.escape, recovery.escapeUntil = nil, nil
+                else
+                    FH.MoveWatch = nil
+                end
             end
         end
         mode, wps, wpi, wpFull = "path", w, index, full
@@ -7047,6 +7115,11 @@ function Follow.WalkTo(token, getGoal, stopDist, abort, opts)
             if not (keep and flatDist > 5 and keep()) then return finish("arrived", true) end
         end
         if job and not job.done and now - job.at > 8 then return finish("timeout", true) end
+        if Follow.ActiveEscape(token, hum, root) then
+            FH.Move(token, hum, goal)
+            task.wait(0.03)
+            continue
+        end
         if job and job.done then
             local j = job
             job = nil
@@ -7824,13 +7897,20 @@ function Follow.Chase(token, getGoal, stopDist, abort, keep)
         FH.Tick(hum, root)
         local jump = (stable and FH.JumpFlight) or FH.Jmp
         local jumping = hum.FloorMaterial == Enum.Material.Air and jump and jump.hum == hum and jump.root == root
-        if FH.Motion.replanToken == token then return finish("trapped", false) end
+        local escaping = Follow.ActiveEscape(token, hum, root)
+        if FH.Motion.replanToken == token and not escaping then return finish("trapped", false) end
         if
             flatDist <= sd
             and dyg < Follow.MaxDY
             and (sd <= 3.5 or flatDist <= 2.5 or sd >= 20 or FH.Sight(rp, goal))
         then
             if not (keep and flatDist > 5 and keep()) then return finish("arrived", true) end
+        end
+
+        if escaping then
+            FH.Move(token, hum, goal)
+            task.wait(0.03)
+            continue
         end
 
         if FH.ForceUnstick then
@@ -7919,7 +7999,7 @@ function Follow.Chase(token, getGoal, stopDist, abort, keep)
             FH.Move(token, hum, aimNow)
         end
         -- kẹt cứng
-        if not lastPos or (rp - lastPos).Magnitude >= 0.8 then
+        if not lastPos or Flat(rp - lastPos).Magnitude >= 0.8 then
             lastPos, lastChk, stuckN = rp, now, 0
         elseif now - lastChk >= 1.2 then
             lastChk = now
@@ -16996,7 +17076,7 @@ TrackConnection(LocalPlayer.CharacterRemoving:Connect(CB.BeastClear))
 -- ================= END BEAST CLICK ANIMATIONS =================
 
 -- ================= EMOTE [6] / SPECTATE [7] =================
-EX.Group, EX.Page, EX.List = 1, 1, {}
+EX.Group, EX.List = 1, {}
 EX.SelfColor = Color3.fromRGB(180, 85, 15)
 function EX.SubjectFor(player)
     local character = player and player.Character
@@ -17065,7 +17145,6 @@ function EX.RebuildPlayers(skip)
     end
     table.sort(list, function(a, b) return a.UserId < b.UserId end)
     EX.List = list
-    EX.Page = math.clamp(EX.Page, 1, math.max(1, math.ceil(#list / 4)))
     if EX.Mode ~= "spectate" or not EX.Target then return end
     local subject = EX.SubjectFor(EX.Target)
     local valid = EX.Target ~= skip and subject ~= nil and subject == EX.TargetSubject
@@ -17093,7 +17172,7 @@ function EX.Refresh()
     EX.Extra.Visible = EX.Mode == "spectate"
     if EX.Mode == "emote" then
         local group = EM.Groups[EX.Group]
-        EX.Section.Text = group.Name .. " [" .. EX.Group .. "/4]  R >"
+        EX.Section.Text = group.Name .. " [" .. EX.Group .. "/4]  Q >"
         for i, row in ipairs(EX.Rows) do
             local data = group[i]
             row.Visible = true
@@ -17103,11 +17182,10 @@ function EX.Refresh()
         EX.Extra.Text = ""
         EX.Footer.Text = EM.LastError or "Same key: stop emote"
     else
-        local pages = math.max(1, math.ceil(#EX.List / 4))
-        EX.Section.Text = "Players [" .. EX.Page .. "/" .. pages .. "]  R >"
+        EX.Section.Text = "Players [1-4]"
         for i, row in ipairs(EX.Rows) do
             row.Visible = i <= 4
-            local player = i <= 4 and EX.List[(EX.Page - 1) * 4 + i] or nil
+            local player = i <= 4 and EX.List[i] or nil
             local name = player and (player.DisplayName ~= "" and player.DisplayName or player.Name)
             row.Text = player and i .. ". " .. name or (i == 1 and #EX.List == 0 and "No players available" or "")
             row.TextColor3 = player and player == EX.Target and GREEN
@@ -17123,7 +17201,7 @@ function EX.Select(index)
         EM.Toggle(EX.Group, index)
     elseif EX.Mode == "spectate" then
         if index < 1 or index > 4 then return false end
-        local player = EX.List[(EX.Page - 1) * 4 + index]
+        local player = EX.List[index]
         local subject = EX.SubjectFor(player)
         if subject then
             EX.Target, EX.TargetSubject = player, subject
@@ -17133,12 +17211,10 @@ function EX.Select(index)
     EX.Refresh()
 end
 function EX.CycleSection()
-    if EX.Mode == "emote" then
-        EX.Group = EX.Group % #EM.Groups + 1
-    elseif EX.Mode == "spectate" then
-        EX.Page = EX.Page % math.max(1, math.ceil(#EX.List / 4)) + 1
-    end
+    if EX.Mode ~= "emote" then return false end
+    EX.Group = EX.Group % #EM.Groups + 1
     EX.Refresh()
+    return true
 end
 function EX.SetMode(mode)
     if EX.Mode == "spectate" and mode ~= "spectate" then EX.StopSpectate() end
@@ -17522,11 +17598,11 @@ TrackConnection(UserInputService.InputBegan:Connect(function(input, gameProcesse
         EX.ToggleEmote()
         return
     end
+    if EX.Mode == "emote" and keyCode == Enum.KeyCode.Q then
+        EX.CycleSection()
+        return
+    end
     if EX.Mode ~= "closed" and ScreenGui.Enabled then
-        if keyCode == Enum.KeyCode.R then
-            EX.CycleSection()
-            return
-        end
         local pick = NUM_KEYS[keyCode]
         if EX.Mode == "emote" and pick and pick <= 5 then
             EX.Select(pick)
