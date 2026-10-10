@@ -48,6 +48,20 @@ local invis_transparency = 0.75
 local shiftLockActive, fpsBoostActive = false, false
 local crosshairState = 0
 local Btn = {}
+local EM = {}
+local EX = { Mode = "closed" }
+EX.NumberKeys = {
+    [Enum.KeyCode.One] = 1,
+    [Enum.KeyCode.KeypadOne] = 1,
+    [Enum.KeyCode.Two] = 2,
+    [Enum.KeyCode.KeypadTwo] = 2,
+    [Enum.KeyCode.Three] = 3,
+    [Enum.KeyCode.KeypadThree] = 3,
+    [Enum.KeyCode.Four] = 4,
+    [Enum.KeyCode.KeypadFour] = 4,
+    [Enum.KeyCode.Five] = 5,
+    [Enum.KeyCode.KeypadFive] = 5,
+}
 local Speed = {
     Run = 32,
     LightScale = 1.0125,
@@ -239,6 +253,7 @@ TrackConnection(UserInputService.InputBegan:Connect(function(input)
     if input.UserInputType ~= Enum.UserInputType.Keyboard then return end
     if UserInputService:GetFocusedTextBox() then return end
     local k = input.KeyCode
+    if EX.Mode ~= "closed" and EX.NumberKeys[k] then return end
     if Ctl.Ignore[k] or Ctl.IsSelf(k) then return end
     Ctl.Down[k] = true
 end))
@@ -416,6 +431,7 @@ local function ShiftLockStep()
     local hum = GetHumanoid()
     local cam = Workspace.CurrentCamera
     if hrp and hum and cam then
+        if EX.Mode == "spectate" or EM.ComboState then return end
         if FH and FH.IsFlipActive and FH.IsFlipActive() then return end
         if FH and FH.MotionActive and FH.MotionActive() and not Ctl.On() then
             hum.AutoRotate = true
@@ -1043,6 +1059,7 @@ local function TogglePlayerESP()
     espPlayerActive = not espPlayerActive
     SetOn(Btn.EspPlayer, espPlayerActive)
     if not espPlayerActive then ClearAllPlayerESP() end
+    if EX.UpdateSelfESP then EX.UpdateSelfESP() end
 end
 -- ================= ESP COMP [G] =================
 local compESPBusy = false
@@ -2303,6 +2320,9 @@ FH.RAG = { "Ragdoll" }
 FH.ESC = { "Escaped" }
 FH.HP = { "Health" }
 FH.BEASTN = { "IsBeast" }
+FH.HACK_TYPING = { "IsTyping", "Typing", "IsHacking" }
+FH.HACK_EVENT = { "ActionEvent" }
+FH.HACK_INPUT = { "ActionInput" }
 local function Flat(v) return Vector3.new(v.X, 0, v.Z) end
 local function dbg(...)
     if Follow.Debug then print("[Follow]", ...) end
@@ -2365,6 +2385,90 @@ function FH.IsWorking(token)
         and (work.kind == "hack" or work.kind == "exit")
         and Follow.InputOwner == token
         and (Follow.Held ~= nil or Follow.KeyDown == true)
+end
+-- Watch the attempted destination even when a blocked lane refuses MoveTo.
+-- A short, expiring intent covers rejected moves without reviving finished tasks.
+function FH.NoteStallIntent(token, hum, goal, intentGoal)
+    local root = hum.RootPart
+    if not root then return end
+    local desired, now = intentGoal or goal, os.clock()
+    if Flat(desired - root.Position).Magnitude <= 0.8 and math.abs(desired.Y - root.Position.Y) <= Follow.MaxDY then
+        if FH.StallIntent and FH.StallIntent.token == token then FH.StallIntent = nil end
+        return
+    end
+    local state = FH.StallIntent
+    if not state or state.token ~= token or state.hum ~= hum or state.root ~= root or now - state.seen > 1.2 then
+        state = { token = token, hum = hum, root = root, anchor = root.Position, at = now, jumped = false }
+        FH.StallIntent = state
+    end
+    state.goal, state.seen = desired, now
+end
+-- Feature toggles do not imply hacking: check the live interaction or game state.
+function FH.IsHacking(token)
+    if FH.IsWorking(token) and FH.Work.kind == "hack" then return true end
+    if remoteHackEvent and remoteHackEvent.Parent then return true end
+    if FH.True(LocalPlayer, FH.HACK_TYPING) then return true end
+    local input, event = FH.Stat(LocalPlayer, FH.HACK_INPUT), FH.Stat(LocalPlayer, FH.HACK_EVENT)
+    local target = event and event.Value
+    if not target or not input or input.Value ~= true then return false end
+    local trigger = target.Name:sub(1, 15) == "ComputerTrigger" and target or target.Parent
+    return trigger ~= nil and trigger.Name:sub(1, 15) == "ComputerTrigger"
+end
+-- Shared render callback samples at most ten times per second, with no raycasts.
+-- One grounded jump belongs to each stationary period; only real progress rearms it.
+function FH.StallJumpStep()
+    local state = FH.StallIntent
+    if not state then return false end
+    local now = os.clock()
+    if now < (FH.StallCheckAt or 0) then return false end
+    FH.StallCheckAt = now + 0.1
+    local token, hum, root = state.token, state.hum, state.root
+    if
+        unloaded
+        or now - state.seen > 1.2
+        or hum ~= GetHumanoid()
+        or root ~= RootNow()
+        or hum.Health <= 0
+        or hum.Sit
+        or hum.PlatformStand
+        or Ctl.On()
+        or Fly.Active
+        or EM.ComboState
+        or UserInputService:GetFocusedTextBox()
+        or now < Follow.PauseUntil
+        or not FH.MotionAvailable(token)
+        or FH.True(LocalPlayer, FH.CAP)
+        or FH.True(LocalPlayer, FH.RAG)
+        or FH.IsWorking(token)
+        or FH.IsHacking(token)
+        or (Follow.InputOwner == token and (Follow.Held or Follow.KeyDown))
+        or AR.Held
+        or AR.KeyDown
+        or TR.Held
+        or TR.KeyDown
+    then
+        FH.StallIntent = nil
+        return false
+    end
+    local rp = root.Position
+    if Flat(state.goal - rp).Magnitude <= 0.8 and math.abs(state.goal.Y - rp.Y) <= Follow.MaxDY then
+        FH.StallIntent = nil
+        return false
+    end
+    if Flat(rp - state.anchor).Magnitude >= 0.35 then
+        state.anchor, state.at, state.jumped = rp, now, false
+    end
+    local flight = FH.JumpFlight or FH.Jmp
+    if flight and flight.hum == hum and flight.root == root and now - flight.t <= 1.2 then state.jumped = true end
+    if hum.FloorMaterial == Enum.Material.Air then
+        state.anchor, state.at = rp, now
+        return false
+    end
+    if state.jumped or now - state.at < 0.8 then return false end
+    if not FH.Jump(hum, false) then return false end
+    state.jumped = true
+    if FH.JumpFlight then FH.JumpFlight.token = token end
+    return true
 end
 -- Measure actual progress even when a blocked MoveTo keeps renewing its lease.
 -- The owning task issues the recovery move itself, so no second loop can fight it.
@@ -2485,6 +2589,7 @@ function FH.Move(token, hum, goal, force, intentGoal)
     if not (hum and goal) or hum.Health <= 0 or Ctl.On() or Fly.Active or not FH.MotionAvailable(token) then
         return false
     end
+    FH.NoteStallIntent(token, hum, goal, intentGoal)
     local root = hum.RootPart
     local function rejected(point)
         if
@@ -2537,6 +2642,7 @@ function FH.Move(token, hum, goal, force, intentGoal)
     return true
 end
 function FH.ReleaseMotion(token, stop)
+    if FH.StallIntent and FH.StallIntent.token == token then FH.StallIntent = nil end
     local m = FH.Motion
     if m.token ~= token then return false end
     if stop and not Ctl.On() and not Fly.Active then
@@ -2551,6 +2657,11 @@ function FH.ReleaseMotion(token, stop)
     return true
 end
 function FH.CancelMotion(owner)
+    local intent = FH.StallIntent
+    if intent then
+        local name = type(intent.token) == "table" and (intent.token.owner or "command") or "follow"
+        if owner == nil or owner == name then FH.StallIntent = nil end
+    end
     local token = FH.Motion.token
     if token == nil then return end
     local name = type(token) == "table" and (token.owner or "command") or "follow"
@@ -2561,6 +2672,8 @@ function FH.ResetCaches(keep)
     FH.Jmp = nil
     FH.JumpFlight = nil
     FH.MotionProbe = nil
+    FH.StallIntent = nil
+    FH.StallCheckAt = nil
     if keep then return end
     table.clear(DoorFail)
     table.clear(DoorTries)
@@ -3204,9 +3317,16 @@ function FH.JumpMoveStep()
     hum:Move(direction.Unit, false)
     motion.sentAt = os.clock()
 end
+function FH.MotionStep()
+    FH.StallJumpStep()
+    FH.JumpMoveStep()
+end
 RunService:BindToRenderStep("NovaJumpMove", Enum.RenderPriority.Input.Value + 1, function()
-    local ok = pcall(FH.JumpMoveStep)
-    if not ok then FH.JumpFlight = nil end
+    local ok = pcall(FH.MotionStep)
+    if not ok then
+        FH.JumpFlight = nil
+        FH.StallIntent = nil
+    end
 end)
 function FH.TryJump(hum, root, aim, feetY, kind, sill)
     if
@@ -3659,7 +3779,7 @@ function FH.Seg(ax, az, dir, curY, seg, settings, ignoreBad)
     local gy = g.Position.Y
     if gy - curY > 3.2 then return nil, "rise" end
     if curY - gy > Follow.MaxDrop then return nil, "drop" end
-    return gy, jumped
+    return gy, jumped, sill
 end
 function FH.Line(rp, goal, feetY, gY, tol, settings, ignoreBad)
     local d = Flat(goal - rp)
@@ -6356,6 +6476,84 @@ function Follow.RecheckLane(state, root, index, point, feetY, check)
     state.clear = check()
     return state.clear
 end
+-- Rescue can cross a low obstruction instead of following the native path's
+-- walking detour. Every shoulder lane still needs floor, headroom and landing.
+function Follow.RescueJumpLane(rp, point, feetY)
+    local delta = Flat(point - rp)
+    local distance = delta.Magnitude
+    if distance < 3 or distance > 18 or math.abs(point.Y - feetY) > 2.5 then return nil end
+    local direction = delta.Unit
+    local across = Vector3.new(-direction.Z, 0, direction.X)
+    local radius = FH.BodyRadius()
+    local steps = math.ceil(distance / 3)
+    local length = distance / steps
+    local centerJumps, centerBig = 0, 0
+    for _, offset in ipairs({ 0, radius, -radius }) do
+        local origin, floorY = rp + across * offset, feetY
+        local jumps, big = 0, 0
+        for i = 0, steps - 1 do
+            local x, z = origin.X + direction.X * length * i, origin.Z + direction.Z * length * i
+            local floor, jump, sill = FH.Seg(x, z, direction, floorY, length)
+            if not floor then return nil end
+            if jump then
+                jumps = jumps + 1
+                if jump == "jump2" then big = big + 1 end
+                if jumps > 3 or big > 1 then return nil end
+                local rise = (sill or 0) + 0.5
+                local head = Vector3.new(x, floorY + Follow.BodyH + 0.1, z)
+                if Workspace:Raycast(head, Vector3.new(0, rise, 0), rayParams) then return nil end
+                local crest = Vector3.new(x, floorY + (sill or 0) + 0.2, z) + direction * (length * 0.5)
+                if Workspace:Raycast(crest, Vector3.new(0, Follow.BodyH, 0), rayParams) then return nil end
+            end
+            floorY = floor
+        end
+        if math.abs(floorY - point.Y) > 1.5 then return nil end
+        local landing = point + across * offset
+        local floor =
+            Workspace:Raycast(Vector3.new(landing.X, point.Y + 3, landing.Z), Vector3.new(0, -6, 0), rayParams)
+        if not floor or floor.Normal.Y < 0.6 or math.abs(floor.Position.Y - point.Y) > 1.5 then return nil end
+        local feet = Vector3.new(landing.X, floor.Position.Y + 0.2, landing.Z)
+        if Workspace:Raycast(feet, Vector3.new(0, Follow.BodyH, 0), rayParams) then return nil end
+        if offset == 0 then
+            centerJumps, centerBig = jumps, big
+        end
+    end
+    if centerJumps == 0 then return nil end
+    return centerJumps, centerBig
+end
+function Follow.RescueShortcut(rp, feetY, wps, index, blockedAt, goal)
+    if not (wps and wps[index] and goal) then return nil end
+    local routeLength = (wps[index].Position - Vector3.new(rp.X, feetY, rp.Z)).Magnitude
+    local candidates = {}
+    local goalDistance = Flat(goal - rp).Magnitude
+    local last = math.min(#wps, index + 10, blockedAt and blockedAt - 1 or #wps)
+    for i = index + 1, last do
+        local point = wps[i].Position
+        routeLength = routeLength + (point - wps[i - 1].Position).Magnitude
+        local distance = Flat(point - rp).Magnitude
+        local saved = routeLength - distance
+        if
+            distance >= 3
+            and distance <= 18
+            and saved > 2
+            and math.abs(point.Y - feetY) <= 2.5
+            and wps[i].Action ~= Enum.PathWaypointAction.Jump
+            and Flat(goal - point).Magnitude < goalDistance - 1
+        then
+            candidates[#candidates + 1] = { index = i, point = point, saved = saved }
+        end
+    end
+    table.sort(candidates, function(a, b) return a.saved > b.saved end)
+    local hum = GetHumanoid()
+    local speed = hum and math.max(hum.WalkSpeed, 1) or 16
+    -- Bound ray work even if a native path contains many small detour points.
+    for i = 1, math.min(2, #candidates) do
+        local candidate = candidates[i]
+        local jumps, big = Follow.RescueJumpLane(rp, candidate.point, feetY)
+        if jumps and candidate.saved > 2 + speed * (jumps * 0.16 + big * 0.18) then return candidate.index end
+    end
+    return nil
+end
 function Follow.WalkTo(token, getGoal, stopDist, abort, opts)
     opts = opts or {}
     local noDoor, maxTime, nearOk, evade = opts.noDoor, opts.maxTime, opts.nearOk, opts.evade
@@ -6375,6 +6573,7 @@ function Follow.WalkTo(token, getGoal, stopDist, abort, opts)
     local fails, doorTries, radIdx, escTries = 0, 0, 1, 0
     local startT = os.clock()
     local laAt, laIdx = 0, nil
+    local rescueShortcutAt = -math.huge
     local LA = evade and 9 or 6
     local gen, job = 0, nil
     local activePath, blockedConn, blockedAt, jumpIndex
@@ -6401,6 +6600,7 @@ function Follow.WalkTo(token, getGoal, stopDist, abort, opts)
         end
         blockedAt = nil
         jumpIndex, jumpTraversal, groundedFeetY = nil, nil, nil
+        rescueShortcutAt = -math.huge
         table.clear(lookaheadCheck)
     end
     local function reset()
@@ -6901,6 +7101,21 @@ function Follow.WalkTo(token, getGoal, stopDist, abort, opts)
             aim = goal
         else
             local fp = Vector3.new(rp.X, feetY, rp.Z)
+            if
+                opts.rescueJuke
+                and hum.FloorMaterial ~= Enum.Material.Air
+                and not FH.JumpFlight
+                and now - rescueShortcutAt >= 0.25
+            then
+                rescueShortcutAt = now
+                local shortcut = Follow.RescueShortcut(rp, feetY, wps, wpi, blockedAt, opts.rescueJuke)
+                if shortcut then
+                    -- Commit the verified landing. Keeping old detour indices
+                    -- would turn the character back after it crossed the obstacle.
+                    wpi, laIdx = shortcut, nil
+                    laAt = now
+                end
+            end
             -- A committed lookahead can pass intermediate waypoints. Once we
             -- reach its destination, continue there instead of turning back.
             if stableFollow and laIdx and laIdx > wpi and laIdx <= #wps and (not blockedAt or laIdx < blockedAt) then
@@ -14275,6 +14490,7 @@ function Cmd.AimBind(getPos, id)
             Cmd.AimUnbind(id)
             return
         end
+        if EX.Mode == "spectate" then return end
         local cam, pos = Workspace.CurrentCamera, getPos()
         if not (cam and pos) then return end
         local cp, aim = cam.CFrame.Position, pos + Vector3.new(0, 1.5, 0)
@@ -14851,6 +15067,8 @@ function Cmd.Exec(player, intent, silent, text, target, modeToken)
         if not silent then CB.Say("manual controls are active; finish controlling me before that command") end
         return
     end
+    -- Restore the combo before a new command snapshots or changes body properties.
+    if EM.ComboState then EM.Stop() end
     -- The newest explicit request wins; autonomous features keep their settings and paths.
     Cmd.Cleanup(Cmd.Token)
     Cmd.Token = Cmd.Token + 1
@@ -15553,7 +15771,7 @@ do
             return
         end
         local t = Follow.Target
-        if not t or Fly.Active or Ctl.On() or Cmd.AimToken or Cmd.FlipState then return end
+        if EX.Mode == "spectate" or not t or Fly.Active or Ctl.On() or Cmd.AimToken or Cmd.FlipState then return end
         local now = os.clock()
         if now - lastChk > 0.3 then
             lastChk = now
@@ -15661,6 +15879,700 @@ task.spawn(function()
         end
     end
 end)
+-- ================= R6 EMOTE ENGINE [6] =================
+-- The small menu owns its buttons; this engine owns only one track/combo at a time.
+EM.SpeedLevels, EM.SpeedIndex = { 0.5, 1, 2, 4 }, 2
+EM.Token = 0
+EM.Groups = {
+    {
+        Name = "Main Emote",
+        { Name = "SIUUU", Type = "Combo" },
+        { Name = "Tool Handle", Id = "125750867", Speed = 1, Looped = true },
+        { Name = "Dab", Id = "248263260", Speed = 1, Looped = true },
+        { Name = "Moving Dance", Id = "429703734", Speed = 1, Looped = true },
+        { Name = "Faint", Id = "181526230", Speed = 1, Looped = true },
+    },
+    {
+        Name = "Movement",
+        { Name = "Dino Walk", Id = "204328711", Speed = 1.5, Looped = true },
+        { Name = "Scared", Id = "180612465", Speed = 1, Looped = true, HoldTime = 0.5 },
+        { Name = "Spinner", Id = "188632011", Speed = 2, Looped = true },
+        { Name = "Head Throw", Id = "35154961", Speed = 1, Looped = false },
+        { Name = "Arm Turbine", Id = "259438880", Speed = 3, Looped = true },
+    },
+    {
+        Name = "Dance",
+        { Name = "Moving Dance", Id = "429703734", Speed = 1, Looped = true },
+        { Name = "Jumping Jack", Id = "429681631", Speed = 1, Looped = true },
+        { Name = "Goofy Dance", Id = "27789359", Speed = 0.8, Looped = true },
+        { Name = "Moon Dance", Id = "45834924", Speed = 1, Looped = true },
+        { Name = "Bang", Id = "148840371", Speed = 3, Looped = true },
+    },
+    {
+        Name = "More",
+        { Name = "Punches", Id = "126753849", Speed = 2, Looped = true },
+        { Name = "Hero", Id = "184574340", Speed = 1, Looped = false },
+        { Name = "Clone Illusion", Id = "215384594", Speed = 1e10, Looped = true },
+        { Name = "Barrel", Id = "136801964", Speed = 1, Looped = true },
+        { Name = "Insane", Id = "33796059", Speed = 1e8, Looped = true },
+    },
+}
+-- Selecting Moving Dance from either category controls the same emote.
+EM.Groups[3][1] = EM.Groups[1][4]
+function EM.Changed()
+    if EM.OnChanged then pcall(EM.OnChanged) end
+end
+function EM.Disconnect(field)
+    local connection = EM[field]
+    EM[field] = nil
+    if connection then pcall(function() connection:Disconnect() end) end
+end
+function EM.RestoreProperty(state, name)
+    local saved = state and state[name]
+    if not saved then return end
+    state[name] = nil
+    pcall(function()
+        if saved.hum.Parent and saved.hum[saved.property] == saved.applied then
+            saved.hum[saved.property] = saved.value
+        end
+    end)
+end
+function EM.SaveProperty(state, name, hum, property, value)
+    local saved = { hum = hum, property = property, value = hum[property], applied = value }
+    state[name] = saved
+    hum[property] = value
+end
+function EM.RestoreCombo(state)
+    if not state then return end
+    EM.RestoreProperty(state, "walk")
+    EM.RestoreProperty(state, "jump")
+    EM.RestoreProperty(state, "rotate")
+    -- A newer feature may extend these deadlines; never undo its pause.
+    if Follow.PauseUntil == state.pauseApplied then Follow.PauseUntil = state.pauseBefore end
+    if FH.PrioUntil == state.prioApplied then FH.PrioUntil = state.prioBefore end
+    if state.motion then FH.ReleaseMotion(state.motion, true) end
+end
+function EM.Stop()
+    EM.Token = EM.Token + 1
+    EM.Disconnect("HoldConnection")
+    EM.Disconnect("StoppedConnection")
+    EM.Disconnect("DeathConnection")
+    local track, anim, state = EM.CurrentTrack, EM.CurrentAnimation, EM.ComboState
+    EM.CurrentTrack, EM.CurrentAnimation, EM.CurrentData, EM.ComboState = nil, nil, nil, nil
+    EM.Frozen = false
+    EM.RestoreCombo(state)
+    if track then
+        pcall(function()
+            track:AdjustSpeed(1)
+            track:Stop(0)
+        end)
+        pcall(function() track:Destroy() end)
+    end
+    if anim then pcall(function() anim:Destroy() end) end
+    EM.Changed()
+end
+function EM.Animator(hum)
+    if not hum or hum.Health <= 0 or hum.RigType ~= Enum.HumanoidRigType.R6 then return nil end
+    local animator = hum:FindFirstChildOfClass("Animator")
+    if not animator then
+        animator = Instance.new("Animator")
+        animator.Parent = hum
+    end
+    return animator
+end
+function EM.LoadTrack(animator, data)
+    local anim = Instance.new("Animation")
+    anim.AnimationId = "rbxassetid://" .. data.Id
+    local ok, track = pcall(function() return animator:LoadAnimation(anim) end)
+    if not ok or not track then
+        anim:Destroy()
+        return nil
+    end
+    local played = pcall(function()
+        track.Looped = data.Looped
+        track.Priority = Enum.AnimationPriority.Action4
+        track:Play(0.15, 1, data.Speed * EM.SpeedLevels[EM.SpeedIndex])
+    end)
+    if not played then
+        pcall(function() track:Stop(0) end)
+        pcall(function() track:Destroy() end)
+        anim:Destroy()
+        return nil
+    end
+    return track, anim
+end
+function EM.WatchDeath(hum, generation)
+    EM.DeathConnection = hum.Died:Connect(function()
+        if EM.Token == generation then EM.Stop() end
+    end)
+end
+function EM.Play(data)
+    local hum = GetHumanoid()
+    local animator = EM.Animator(hum)
+    if not animator then
+        EM.LastError = "R6 character required"
+        EM.Changed()
+        return false
+    end
+    local track, anim = EM.LoadTrack(animator, data)
+    if not track then
+        EM.LastError = "Animation unavailable"
+        EM.Changed()
+        return false
+    end
+    local generation = EM.Token
+    EM.CurrentTrack, EM.CurrentAnimation, EM.CurrentData = track, anim, data
+    EM.LastError, EM.Frozen = nil, false
+    EM.StoppedConnection = track.Stopped:Connect(function()
+        if EM.Token == generation and EM.CurrentTrack == track then EM.Stop() end
+    end)
+    EM.WatchDeath(hum, generation)
+    if data.HoldTime then
+        EM.HoldConnection = RunService.Heartbeat:Connect(function()
+            if unloaded or EM.Token ~= generation or EM.CurrentTrack ~= track then
+                if EM.Token == generation then EM.Stop() end
+                return
+            end
+            if track.TimePosition >= data.HoldTime then
+                track:AdjustSpeed(0)
+                track.TimePosition = data.HoldTime
+                EM.Frozen = true
+                EM.Disconnect("HoldConnection")
+            end
+        end)
+    end
+    EM.Changed()
+    return true
+end
+function EM.ComboValid(state)
+    return not unloaded
+        and EM.ComboState == state
+        and EM.Token == state.generation
+        and state.root.Parent == state.character
+        and state.hum.Parent == state.character
+        and LocalPlayer.Character == state.character
+        and state.hum.Health > 0
+        and not state.hum.Sit
+        and not Fly.Active
+        and not Ctl.On()
+        and not AH.Down()
+end
+function EM.ComboLease(state)
+    if not EM.ComboValid(state) or not FH.MotionAvailable(state.motion) then return false end
+    local now, motion = os.clock(), FH.Motion
+    if motion.token ~= state.motion then
+        motion.token, motion.hum, motion.priority = state.motion, state.hum, FH.MotionPriority(state.motion)
+        motion.aim, motion.sentAt = state.root.Position, now
+    end
+    motion.untilAt = now + 0.35
+    state.pauseApplied = math.max(Follow.PauseUntil, now + 0.35)
+    Follow.PauseUntil = state.pauseApplied
+    state.prioApplied = math.max(FH.PrioUntil or 0, now + 0.35)
+    FH.PrioUntil = state.prioApplied
+    return true
+end
+function EM.ComboWait(state, duration, interval)
+    local untilAt = os.clock() + duration
+    while os.clock() < untilAt do
+        if not EM.ComboLease(state) then return false end
+        task.wait(math.min(interval or 0.05, untilAt - os.clock()))
+    end
+    return EM.ComboLease(state)
+end
+function EM.OwnsWalk()
+    local state = EM.ComboState
+    local saved = state and state.walk
+    return saved ~= nil and saved.hum.Parent == state.character and saved.hum[saved.property] == saved.applied
+end
+function EM.ComboPhase(state, kind, duration)
+    local phase = {
+        kind = kind,
+        duration = duration,
+        elapsed = 0,
+        at = os.clock(),
+        rate = EM.SpeedLevels[EM.SpeedIndex],
+    }
+    state.phase = phase
+    return phase
+end
+function EM.ComboPhaseTick(phase)
+    local now = os.clock()
+    phase.elapsed = phase.elapsed + math.max(now - phase.at, 0) * phase.rate
+    if phase.duration - phase.elapsed <= 0.000001 then phase.elapsed = phase.duration end
+    phase.at = now
+    return math.clamp(phase.elapsed / phase.duration, 0, 1)
+end
+function EM.ComboScaledWait(state, duration, kind, interval)
+    local phase = EM.ComboPhase(state, kind, duration)
+    while phase.elapsed < duration do
+        if not EM.ComboLease(state) then return false end
+        EM.ComboPhaseTick(phase)
+        if phase.elapsed >= duration then break end
+        task.wait(math.min(interval or 0.05, (duration - phase.elapsed) / phase.rate))
+    end
+    if state.phase == phase then state.phase = nil end
+    return EM.ComboLease(state)
+end
+function EM.RunCombo(state, animator)
+    if not EM.ComboLease(state) then return end
+    local hum, root = state.hum, state.root
+    FH.Jmp, FH.JumpFlight = nil, nil
+    pcall(Follow.Release)
+    pcall(AH.ReleaseTap)
+    pcall(AR.Release)
+    pcall(TR.Release)
+    -- Keep the uploaded Siuuu movement: 14-stud runup, 0.85 base speed, 1.2 jump.
+    state.walkBase = hum.WalkSpeed * 0.85
+    EM.SaveProperty(state, "walk", hum, "WalkSpeed", state.walkBase * EM.SpeedLevels[EM.SpeedIndex])
+    local runSpeed = math.max(state.walkBase, 1)
+    local goal = root.Position + root.CFrame.LookVector * 14
+    FH.Motion.aim, FH.Motion.sentAt = goal, os.clock()
+    hum:MoveTo(goal)
+    if not EM.ComboScaledWait(state, 14 / runSpeed, "run") then return end
+    -- The original landing/run buffers use real time, independent of emote speed.
+    if not EM.ComboWait(state, 0.1) then return end
+    hum:MoveTo(root.Position)
+    FH.Motion.aim, FH.Motion.sentAt = root.Position, os.clock()
+    EM.RestoreProperty(state, "walk")
+
+    local jumpProperty = hum.UseJumpPower and "JumpPower" or "JumpHeight"
+    EM.SaveProperty(state, "jump", hum, jumpProperty, hum[jumpProperty] * 1.2)
+    hum.Jump = true
+    hum:ChangeState(Enum.HumanoidStateType.Jumping)
+    if not EM.ComboWait(state, 0.1) then return end
+    EM.RestoreProperty(state, "jump")
+
+    EM.SaveProperty(state, "rotate", hum, "AutoRotate", false)
+    local base = root.CFrame - root.CFrame.Position
+    local phase = EM.ComboPhase(state, "turn", 0.5)
+    while phase.elapsed < phase.duration do
+        if not EM.ComboLease(state) then return end
+        local amount = EM.ComboPhaseTick(phase)
+        root.CFrame = CFrame.new(root.Position) * base * CFrame.Angles(0, math.rad(180 * amount), 0)
+        if phase.elapsed >= phase.duration then break end
+        RunService.Heartbeat:Wait()
+    end
+    if state.phase == phase then state.phase = nil end
+    if not EM.ComboLease(state) then return end
+    root.CFrame = CFrame.new(root.Position) * base * CFrame.Angles(0, math.pi, 0)
+    EM.RestoreProperty(state, "rotate")
+
+    local landBy = os.clock() + 1.5
+    while hum.FloorMaterial == Enum.Material.Air and os.clock() < landBy do
+        if not EM.ComboLease(state) then return end
+        RunService.Heartbeat:Wait()
+    end
+    if not EM.ComboLease(state) or hum.FloorMaterial == Enum.Material.Air then return end
+    local track, anim = EM.LoadTrack(animator, { Id = "429681631", Speed = 1, Looped = false })
+    if not track then return end
+    EM.CurrentTrack, EM.CurrentAnimation = track, anim
+    track.TimePosition = 0.5
+    track:AdjustSpeed(0)
+    EM.Frozen = true
+    EM.StoppedConnection = track.Stopped:Connect(function()
+        if EM.Token == state.generation and EM.CurrentTrack == track then EM.Stop() end
+    end)
+    EM.Changed()
+    EM.ComboScaledWait(state, 3, "pose", 0.1)
+end
+function EM.PlayCombo(data)
+    local hum, root = GetHumanoid(), RootNow()
+    local animator = EM.Animator(hum)
+    if not animator or not root then
+        EM.LastError = "R6 character required"
+        EM.Changed()
+        return false
+    end
+    -- Active hacking and an explicit player command keep their current interaction.
+    if
+        Ctl.On()
+        or Fly.Active
+        or AH.Down()
+        or FH.Prio()
+        or Follow.Held
+        or Follow.KeyDown
+        or FH.IsHacking(FH.Motion.token)
+    then
+        EM.LastError = "Finish the current interaction first"
+        EM.Changed()
+        return false
+    end
+    local state = {
+        hum = hum,
+        root = root,
+        character = LocalPlayer.Character,
+        generation = EM.Token,
+        pauseBefore = Follow.PauseUntil,
+        prioBefore = FH.PrioUntil,
+    }
+    state.motion = { owner = "command", priority = 95, ok = function() return EM.ComboValid(state) end }
+    EM.ComboState, EM.CurrentData, EM.LastError = state, data, nil
+    if not EM.ComboLease(state) then
+        EM.Stop()
+        return false
+    end
+    EM.WatchDeath(hum, state.generation)
+    EM.Changed()
+    task.spawn(function()
+        local ok = pcall(EM.RunCombo, state, animator)
+        if EM.Token == state.generation and EM.ComboState == state then
+            EM.Stop()
+            if not ok then
+                EM.LastError = "Emote interrupted"
+                EM.Changed()
+            end
+        end
+    end)
+    return true
+end
+function EM.Toggle(group, index)
+    if unloaded then return false end
+    local items = EM.Groups[group]
+    local data = items and items[index]
+    if not data then return false end
+    local wasCurrent = EM.CurrentData == data
+    EM.Stop()
+    EM.LastError = nil
+    if wasCurrent then return true end
+    if data.Type == "Combo" then return EM.PlayCombo(data) end
+    return EM.Play(data)
+end
+function EM.CycleSpeed()
+    EM.SpeedIndex = EM.SpeedIndex % #EM.SpeedLevels + 1
+    local state = EM.ComboState
+    if state then
+        if state.phase then
+            -- Account for time at the old rate before switching the remaining phase.
+            EM.ComboPhaseTick(state.phase)
+            state.phase.rate = EM.SpeedLevels[EM.SpeedIndex]
+        end
+        if EM.OwnsWalk() then
+            local saved = state.walk
+            local applied = state.walkBase * EM.SpeedLevels[EM.SpeedIndex]
+            pcall(function()
+                saved.hum[saved.property] = applied
+                saved.applied = applied
+            end)
+        end
+    end
+    local track, data = EM.CurrentTrack, EM.CurrentData
+    if track and data and not EM.Frozen then
+        pcall(function() track:AdjustSpeed((data.Speed or 1) * EM.SpeedLevels[EM.SpeedIndex]) end)
+    end
+    EM.Changed()
+    return EM.SpeedLevels[EM.SpeedIndex]
+end
+TrackConnection(LocalPlayer.CharacterRemoving:Connect(function() EM.Stop() end))
+TrackConnection(LocalPlayer.CharacterAdded:Connect(function() EM.Stop() end))
+-- ================= END R6 EMOTE ENGINE =================
+
+-- ================= EMOTE / SPECTATE [6] =================
+EX.Group, EX.Page, EX.List = 1, 1, {}
+EX.SelfColor = Color3.fromRGB(180, 85, 15)
+function EX.SubjectFor(player)
+    local character = player and player.Character
+    local hum = character and character:FindFirstChildOfClass("Humanoid")
+    return hum and hum.Health > 0 and IsInWorld(character) and hum or nil
+end
+function EX.UpdateSelfESP()
+    local char = LocalPlayer.Character
+    if EX.SelfCharacter and EX.SelfCharacter ~= char then RemoveHighlight(EX.SelfCharacter) end
+    if EX.Mode == "spectate" and espPlayerActive and char and IsInWorld(char) then
+        AttachHighlight(char, EX.SelfColor)
+        EX.SelfCharacter = char
+    else
+        if EX.SelfCharacter then RemoveHighlight(EX.SelfCharacter) end
+        EX.SelfCharacter = nil
+    end
+end
+function EX.RestoreCamera()
+    local saved = EX.CameraState
+    EX.CameraState = nil
+    if not saved then return end
+    pcall(function()
+        local subject = saved.subject
+        if
+            saved.localSubject
+            or not subject
+            or not subject.Parent
+            or not IsInWorld(subject)
+            or subject:IsA("Humanoid") and subject.Health <= 0
+        then
+            subject = GetHumanoid()
+        end
+        saved.camera.CameraSubject = subject
+        saved.camera.CameraType = saved.kind
+        saved.camera.CFrame = saved.cf
+    end)
+end
+function EX.StopSpectate()
+    EX.RestoreCamera()
+    EX.Target = nil
+    if EX.SelfCharacter then RemoveHighlight(EX.SelfCharacter) end
+    EX.SelfCharacter = nil
+end
+function EX.ApplyCamera()
+    if EX.Mode ~= "spectate" or unloaded then return false end
+    local subject, camera = EX.SubjectFor(EX.Target), Workspace.CurrentCamera
+    if not subject or not camera then return false end
+    if EX.CameraState and EX.CameraState.camera ~= camera then EX.RestoreCamera() end
+    if not EX.CameraState then
+        EX.CameraState = {
+            camera = camera,
+            subject = camera.CameraSubject,
+            kind = camera.CameraType,
+            cf = camera.CFrame,
+            localSubject = camera.CameraSubject == GetHumanoid(),
+        }
+    end
+    if camera.CameraType ~= Enum.CameraType.Custom then camera.CameraType = Enum.CameraType.Custom end
+    if camera.CameraSubject ~= subject then camera.CameraSubject = subject end
+    return true
+end
+function EX.RebuildPlayers(skip)
+    local list = {}
+    for _, player in ipairs(Players:GetPlayers()) do
+        if player ~= LocalPlayer and player ~= skip then list[#list + 1] = player end
+    end
+    table.sort(list, function(a, b) return a.UserId < b.UserId end)
+    EX.List = list
+    EX.Page = math.clamp(EX.Page, 1, math.max(1, math.ceil(#list / 5)))
+    if EX.Mode == "spectate" then
+        local valid = EX.Target ~= skip and EX.SubjectFor(EX.Target) ~= nil
+        if valid then
+            valid = false
+            for _, player in ipairs(list) do
+                if player == EX.Target then
+                    valid = true
+                    break
+                end
+            end
+        end
+        if not valid then
+            EX.Target = nil
+            for _, player in ipairs(list) do
+                if EX.SubjectFor(player) then
+                    EX.Target = player
+                    break
+                end
+            end
+        end
+        if not EX.ApplyCamera() then EX.RestoreCamera() end
+    end
+end
+function EX.Refresh()
+    if not EX.Panel then return end
+    EX.Panel.Visible = EX.Mode ~= "closed"
+    if EX.Mode == "closed" then return end
+    EX.Title.Text = EX.Mode == "emote" and "EMOTE [6]" or "SPECTATE [6]"
+    if EX.Mode == "emote" then
+        local group = EM.Groups[EX.Group]
+        EX.Section.Text = group.Name .. " [" .. EX.Group .. "/4]  R >"
+        for i, row in ipairs(EX.Rows) do
+            local data = group[i]
+            row.Text = i .. ". " .. data.Name
+            row.TextColor3 = EM.CurrentData == data and GREEN or Theme.Text
+        end
+        EX.Extra.Text = "0. Speed: " .. tostring(EM.SpeedLevels[EM.SpeedIndex]) .. "x"
+        EX.Footer.Text = EM.LastError or "1-5: emote / stop"
+    else
+        local pages = math.max(1, math.ceil(#EX.List / 5))
+        EX.Section.Text = "Players [" .. EX.Page .. "/" .. pages .. "]  R >"
+        for i, row in ipairs(EX.Rows) do
+            local player = EX.List[(EX.Page - 1) * 5 + i]
+            local name = player and (player.DisplayName ~= "" and player.DisplayName or player.Name)
+            row.Text = player and i .. ". " .. name or (i == 1 and #EX.List == 0 and "No players available" or "")
+            row.TextColor3 = player and player == EX.Target and GREEN
+                or EX.SubjectFor(player) and Theme.Text
+                or Theme.SubText
+        end
+        EX.Extra.Text = "0. Return to my camera"
+        EX.Footer.Text = "1-5: watch player"
+    end
+end
+function EX.Select(index)
+    if EX.Mode == "emote" then
+        EM.Toggle(EX.Group, index)
+    elseif EX.Mode == "spectate" then
+        local player = EX.List[(EX.Page - 1) * 5 + index]
+        if EX.SubjectFor(player) then
+            EX.Target = player
+            EX.ApplyCamera()
+        end
+    end
+    EX.Refresh()
+end
+function EX.CycleSection()
+    if EX.Mode == "emote" then
+        EX.Group = EX.Group % #EM.Groups + 1
+    elseif EX.Mode == "spectate" then
+        EX.Page = EX.Page % math.max(1, math.ceil(#EX.List / 5)) + 1
+    end
+    EX.Refresh()
+end
+function EX.SetMode(mode)
+    if EX.Mode == "spectate" and mode ~= "spectate" then EX.StopSpectate() end
+    EX.Mode = mode
+    if mode == "closed" then
+        EX.Dragging = false
+        if EX.DragConnection then
+            EX.DragConnection:Disconnect()
+            EX.DragConnection = nil
+        end
+    end
+    if mode ~= "closed" then ScreenGui.Enabled = true end
+    if mode == "spectate" then EX.RebuildPlayers() end
+    EX.UpdateSelfESP()
+    EX.Refresh()
+end
+function EX.Toggle() EX.SetMode(EX.Mode == "closed" and "emote" or EX.Mode == "emote" and "spectate" or "closed") end
+function EX.Zero()
+    if EX.Mode == "emote" then
+        EM.CycleSpeed()
+        EX.Refresh()
+    elseif EX.Mode == "spectate" then
+        EX.SetMode("closed")
+    end
+end
+EX.Panel = New("Frame", ScreenGui, {
+    Name = "EmoteSpectate",
+    Size = UDim2.new(0, 160, 0, 148),
+    Position = UDim2.new(0.5, 90, 0.5, -74),
+    BackgroundColor3 = Theme.Background,
+    BackgroundTransparency = 0.15,
+    BorderSizePixel = 0,
+    Visible = false,
+})
+New("UICorner", EX.Panel, { CornerRadius = UDim.new(0, 6) })
+New("UIStroke", EX.Panel, { Color = Theme.Outline })
+EX.Header = New("Frame", EX.Panel, { Size = UDim2.new(1, 0, 0, 20), BackgroundTransparency = 1 })
+EX.Title = New("TextLabel", EX.Header, {
+    Size = UDim2.new(1, -25, 1, 0),
+    Position = UDim2.new(0, 6, 0, 0),
+    BackgroundTransparency = 1,
+    Text = "EMOTE [6]",
+    TextColor3 = Theme.Accent,
+    Font = Enum.Font.GothamBold,
+    TextSize = 10,
+    TextXAlignment = Enum.TextXAlignment.Left,
+})
+EX.Close = New("TextButton", EX.Header, {
+    Size = UDim2.new(0, 19, 0, 18),
+    Position = UDim2.new(1, -21, 0, 1),
+    BackgroundTransparency = 1,
+    Text = "X",
+    TextColor3 = Theme.SubText,
+    Font = Enum.Font.GothamBold,
+    TextSize = 10,
+})
+EX.Section = New("TextButton", EX.Panel, {
+    Size = UDim2.new(1, -8, 0, 14),
+    Position = UDim2.new(0, 4, 0, 20),
+    BackgroundTransparency = 1,
+    Text = "",
+    TextColor3 = Theme.SubText,
+    Font = Enum.Font.GothamMedium,
+    TextSize = 9,
+})
+EX.Rows = {}
+for i = 1, 5 do
+    local row = New("TextButton", EX.Panel, {
+        Size = UDim2.new(1, -8, 0, 15),
+        Position = UDim2.new(0, 4, 0, 34 + (i - 1) * 16),
+        BackgroundColor3 = Theme.ElementBg,
+        BackgroundTransparency = 0.35,
+        BorderSizePixel = 0,
+        Text = "",
+        TextColor3 = Theme.Text,
+        Font = Enum.Font.GothamMedium,
+        TextSize = 10,
+        TextXAlignment = Enum.TextXAlignment.Left,
+        TextTruncate = Enum.TextTruncate.AtEnd,
+    })
+    New("UICorner", row, { CornerRadius = UDim.new(0, 3) })
+    TrackConnection(row.MouseButton1Click:Connect(function() EX.Select(i) end))
+    EX.Rows[i] = row
+end
+EX.Extra = New("TextButton", EX.Panel, {
+    Size = UDim2.new(1, -8, 0, 17),
+    Position = UDim2.new(0, 4, 0, 115),
+    BackgroundTransparency = 1,
+    Text = "",
+    TextColor3 = Theme.Accent,
+    Font = Enum.Font.GothamMedium,
+    TextSize = 9,
+    TextXAlignment = Enum.TextXAlignment.Left,
+})
+EX.Footer = New("TextLabel", EX.Panel, {
+    Size = UDim2.new(1, -8, 0, 14),
+    Position = UDim2.new(0, 4, 0, 133),
+    BackgroundTransparency = 1,
+    Text = "",
+    TextColor3 = Theme.SubText,
+    Font = Enum.Font.GothamMedium,
+    TextSize = 9,
+})
+TrackConnection(EX.Close.MouseButton1Click:Connect(function() EX.SetMode("closed") end))
+TrackConnection(EX.Section.MouseButton1Click:Connect(EX.CycleSection))
+TrackConnection(EX.Extra.MouseButton1Click:Connect(EX.Zero))
+TrackConnection(EX.Header.InputBegan:Connect(function(input)
+    if
+        uiLocked
+        or (input.UserInputType ~= Enum.UserInputType.MouseButton1 and input.UserInputType ~= Enum.UserInputType.Touch)
+    then
+        return
+    end
+    EX.Dragging, EX.DragStart, EX.DragPosition = true, input.Position, EX.Panel.Position
+    if EX.DragConnection then EX.DragConnection:Disconnect() end
+    EX.DragConnection = input.Changed:Connect(function()
+        if input.UserInputState == Enum.UserInputState.End then
+            EX.Dragging = false
+            if EX.DragConnection then
+                EX.DragConnection:Disconnect()
+                EX.DragConnection = nil
+            end
+        end
+    end)
+end))
+TrackConnection(UserInputService.InputChanged:Connect(function(input)
+    if not EX.Dragging or uiLocked or EX.Mode == "closed" then return end
+    if input.UserInputType ~= Enum.UserInputType.MouseMovement and input.UserInputType ~= Enum.UserInputType.Touch then
+        return
+    end
+    local delta, pos = input.Position - EX.DragStart, EX.DragPosition
+    EX.Panel.Position = UDim2.new(pos.X.Scale, pos.X.Offset + delta.X, pos.Y.Scale, pos.Y.Offset + delta.Y)
+end))
+TrackConnection(Players.PlayerAdded:Connect(function()
+    if EX.Mode == "spectate" then
+        EX.RebuildPlayers()
+        EX.Refresh()
+    end
+end))
+TrackConnection(Players.PlayerRemoving:Connect(function(player)
+    if EX.Mode == "spectate" then
+        EX.RebuildPlayers(player)
+        EX.Refresh()
+    end
+end))
+TrackConnection(LocalPlayer.CharacterAdded:Connect(function()
+    if EX.Mode == "spectate" then EX.UpdateSelfESP() end
+end))
+local spectateTimer = 0
+TrackConnection(RunService.Heartbeat:Connect(function(dt)
+    if EX.Mode ~= "spectate" or unloaded then return end
+    spectateTimer += dt
+    if spectateTimer < 0.2 then return end
+    spectateTimer = 0
+    if not EX.SubjectFor(EX.Target) then
+        EX.RebuildPlayers()
+        EX.Refresh()
+    else
+        EX.ApplyCamera()
+    end
+    EX.UpdateSelfESP()
+end))
+EM.OnChanged = EX.Refresh
+
 -- ================= ESP PLAYER =================
 local COLOR_ALIVE = Color3.fromRGB(0, 255, 100)
 local COLOR_BEAST = Color3.fromRGB(255, 0, 0)
@@ -15751,7 +16663,7 @@ TrackConnection(RunService.Stepped:Connect(function(_, dt)
             end
         end
     end
-    if speedActive or Speed.Owned then Speed.Step(GetHumanoid()) end
+    if (speedActive or Speed.Owned) and not EM.OwnsWalk() then Speed.Step(GetHumanoid()) end
 end))
 TrackConnection(UserInputService.JumpRequest:Connect(function()
     if infJumpActive then
@@ -15763,6 +16675,10 @@ end))
 local function UnloadHack()
     if unloaded then return end
     unloaded = true
+    pcall(EM.Stop)
+    EX.Mode = "closed"
+    pcall(EX.StopSpectate)
+    if EX.DragConnection then pcall(function() EX.DragConnection:Disconnect() end) end
     remoteHackActive = false
     espPlayerActive = false
     noclipActive = false
@@ -15848,6 +16764,26 @@ TrackConnection(UserInputService.InputBegan:Connect(function(input, gameProcesse
     end
 
     if gameProcessed or UserInputService:GetFocusedTextBox() then return end
+    local extraSix = keyCode == Enum.KeyCode.Six or keyCode == Enum.KeyCode.KeypadSix
+    if EX.Mode ~= "closed" and extraSix then
+        EX.Toggle()
+        return
+    end
+    if EX.Mode ~= "closed" and ScreenGui.Enabled then
+        if keyCode == Enum.KeyCode.R then
+            EX.CycleSection()
+            return
+        end
+        if keyCode == Enum.KeyCode.Zero or keyCode == Enum.KeyCode.KeypadZero then
+            EX.Zero()
+            return
+        end
+        local pick = NUM_KEYS[keyCode]
+        if pick and pick <= 5 then
+            EX.Select(pick)
+            return
+        end
+    end
     if keyCode == Enum.KeyCode.R then
         ScreenGui.Enabled = not ScreenGui.Enabled
         return
@@ -15897,6 +16833,10 @@ TrackConnection(UserInputService.InputBegan:Connect(function(input, gameProcesse
             Follow.Select(pick)
             return
         end
+    end
+    if extraSix then
+        EX.Toggle()
+        return
     end
     if keyCode == Enum.KeyCode.Nine or keyCode == Enum.KeyCode.KeypadNine then
         AH.Toggle()
