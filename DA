@@ -148,7 +148,7 @@ local TR = {
     List = {},
     Rows = {},
     Key = nil,
-    FrontDistance = 3.2,
+    FrontDistance = 2.4,
     FrontOnlyDistance = 3.6,
     CollisionParts = {},
     CollisionChar = nil,
@@ -265,7 +265,7 @@ TrackConnection(UserInputService.InputBegan:Connect(function(input)
     if Ctl.Ignore[k] or Ctl.IsSelf(k) then return end
     Ctl.Down[k] = true
     if EM.ComboState then
-        if EM.Crawling and EM.Crawling() then
+        if EM.PauseRequired and EM.PauseRequired() then
             EM.PauseForCrawl()
         else
             EM.Stop()
@@ -907,6 +907,19 @@ local function DisableInvisForTeleport()
     toggleInvisibility()
     SetOn(Btn.Invis, invis_on)
     task.wait(0.1)
+end
+-- Manual teleport buttons/keys share one gate, including after a yielded
+-- invisibility change and a pending hide-position correction.
+local function TeleportBlocked()
+    return unloaded
+        or Follow.Target ~= nil
+        or Follow.AutoFarm
+        or Follow.RandomActive
+        or Follow.AutoBeastActive
+        or AH.Active
+        or AR.Active
+        or EM.ComboState ~= nil
+        or EM.PausedState ~= nil and EM.PausedState.data and EM.PausedState.data.Type == "Circle"
 end
 local noclipChar
 local noclipOriginal = setmetatable({}, { __mode = "k" })
@@ -1568,8 +1581,8 @@ function HideTP.Report()
     FlashText(Btn.Hide, "TP Hide [Q] (xem F9)", "TP Hide [Q]", 1.5)
 end
 local function TeleportToHideSpot()
-    if Follow.Target then
-        FlashText(Btn.Hide, "Dang Follow!", "TP Hide [Q]", 1)
+    if TeleportBlocked() then
+        FlashText(Btn.Hide, "Tat che do tu dong!", "TP Hide [Q]", 1)
         return
     end
     local char = LocalPlayer.Character
@@ -1588,7 +1601,7 @@ local function TeleportToHideSpot()
 
         if (s.Pos - root.Position).Magnitude > 1.5 then
             DisableInvisForTeleport()
-            if not char.Parent or not char.PrimaryPart then return end
+            if TeleportBlocked() or not char.Parent or not char.PrimaryPart then return end
             root = char.PrimaryPart
             char:PivotTo(s.Goal)
             root.AssemblyLinearVelocity = Vector3.zero
@@ -1600,7 +1613,7 @@ local function TeleportToHideSpot()
             task.spawn(function()
                 for _ = 1, 3 do
                     RunService.Heartbeat:Wait()
-                    if unloaded or not char.Parent or not char.PrimaryPart then return end
+                    if TeleportBlocked() or not char.Parent or not char.PrimaryPart then return end
                     if (char.PrimaryPart.Position - s.Pos).Magnitude > 2 then
                         char:PivotTo(s.Goal)
                         char.PrimaryPart.AssemblyLinearVelocity = Vector3.zero
@@ -1614,8 +1627,8 @@ end
 -- ================= TP EXIT [Y] =================
 local tpIndex = 1
 local function TeleportToExit()
-    if Follow.Target then
-        FlashText(Btn.TPExit, "Dang Follow!", "TP Exit [Y]", 1)
+    if TeleportBlocked() then
+        FlashText(Btn.TPExit, "Tat che do tu dong!", "TP Exit [Y]", 1)
         return
     end
     local char = LocalPlayer.Character
@@ -1631,7 +1644,7 @@ local function TeleportToExit()
             local ok, pivot = pcall(function() return targetPart:GetPivot() end)
             if ok and pivot then
                 DisableInvisForTeleport()
-                if not char.Parent or not char.PrimaryPart then return end
+                if TeleportBlocked() or not char.Parent or not char.PrimaryPart then return end
                 char:PivotTo(pivot * CFrame.new(0, 0, -5))
                 return
             end
@@ -1808,7 +1821,7 @@ end)
 -- ================= TAB 2: PLAYERS TP =================
 local playerButtons = {}
 local function TeleportToPlayer(targetPlayer)
-    if Follow.Target then return end
+    if TeleportBlocked() then return end
     if
         targetPlayer
         and targetPlayer.Character
@@ -1819,7 +1832,7 @@ local function TeleportToPlayer(targetPlayer)
         DisableInvisForTeleport()
         local myChar = LocalPlayer.Character
         local targetPart = targetPlayer.Character and targetPlayer.Character.PrimaryPart
-        if not myChar or not myChar.PrimaryPart or not targetPart then return end
+        if TeleportBlocked() or not myChar or not myChar.PrimaryPart or not targetPart then return end
         myChar:PivotTo(targetPart.CFrame * CFrame.new(0, 3, 50))
     end
 end
@@ -2613,6 +2626,12 @@ function FH.StallJumpStep()
         return false
     end
     local rp = root.Position
+    local recovery = FH.MoveWatch
+    if recovery and recovery.token == token and recovery.hum == hum and recovery.root == root and recovery.escape then
+        -- A verified side lane already bypasses this obstruction. Do not spend
+        -- the same frame's jump trying the original rejected wall direction.
+        return false
+    end
     if Flat(state.goal - rp).Magnitude <= 0.8 and math.abs(state.goal.Y - rp.Y) <= Follow.MaxDY then
         FH.StallIntent = nil
         return false
@@ -2623,7 +2642,7 @@ function FH.StallJumpStep()
     end
     local flight = FH.JumpFlight or FH.Jmp
     if flight and flight.hum == hum and flight.root == root and now - flight.t <= 1.2 then state.jumped = true end
-    if hum.FloorMaterial == Enum.Material.Air then
+    if hum.FloorMaterial == Enum.Material.Air and not FH.TakeoffSupported(hum, root) then
         state.anchor, state.at = rp, now
         return false
     end
@@ -2695,6 +2714,7 @@ function FH.RecoveryAim(token, hum, goal, intentGoal)
     if progress.Magnitude > 0.1 and Flat(rp - state.anchor):Dot(progress.Unit) >= 0.8 then
         state.anchor, state.at = rp, now
         state.turnGrace, state.graceUntil = nil, nil
+        state.stairAttempts, state.stairRetryUntil = nil, nil
     end
     -- Vertical bouncing does not restart the horizontal stall timer. Keep the
     -- committed destination during a jump, then check its lane after landing.
@@ -2773,6 +2793,7 @@ function FH.RecoveryAim(token, hum, goal, intentGoal)
         if Flat(state.escape - rp).Magnitude <= 0.8 then
             state.escape, state.escapeUntil = nil, nil
             state.anchor, state.at = rp, now
+            state.stairAttempts, state.stairRetryUntil = nil, nil
             replan(nil)
             return goal
         end
@@ -2795,6 +2816,18 @@ function FH.RecoveryAim(token, hum, goal, intentGoal)
         retry = true
     end
     if (not retry and now - state.at < 0.8) or now < (state.graceUntil or 0) then return goal end
+    -- A supported stair lane may need another native takeoff after the first
+    -- hop lands against its next riser. Give it a bounded retry before marking
+    -- that same uphill route as blocked; actual walls still recover at 0.8s.
+    if
+        not retry
+        and (state.stairAttempts or 0) < 3
+        and FH.TakeoffSupported(hum, root)
+        and FH.StairProbe(hum, root, goal)
+    then
+        state.stairRetryUntil = state.stairRetryUntil or now + 0.9
+        if now < state.stairRetryUntil then return goal end
+    end
     state.at, state.anchor = now, rp
     state.turnGrace, state.graceUntil = nil, nil
     FH.RefreshFilter()
@@ -3515,6 +3548,35 @@ function FH.Chat(msg)
     return sent
 end
 function FH.Emote() FH.Chat(math.random() < 0.65 and "/e wave" or "/e dance2") end
+-- Sloping/moving support can leave FloorMaterial at Air even while the avatar
+-- is resting on it. A nearby floor and low vertical velocity permit a native
+-- takeoff; actual falling bodies never obtain a jump from this contact test.
+function FH.TakeoffSupported(hum, root)
+    if not hum then return false end
+    if hum.FloorMaterial ~= Enum.Material.Air then return true end
+    root = root or hum.RootPart
+    if not root or math.abs(root.AssemblyLinearVelocity.Y) > 2 then return false end
+    local ok, state = pcall(function() return hum:GetState() end)
+    if not ok or state == Enum.HumanoidStateType.Jumping then return false end
+    if state == Enum.HumanoidStateType.Freefall then
+        local watch = FH.MoveWatch
+        if
+            not watch
+            or watch.hum ~= hum
+            or watch.root ~= root
+            or not watch.slideSupported
+            or os.clock() - watch.at < 0.8
+            or os.clock() - watch.seen > 0.7
+        then
+            return false
+        end
+    end
+    FH.RefreshFilter()
+    local feetY = FH.Feet(hum, root)
+    local floor =
+        Workspace:Raycast(Vector3.new(root.Position.X, feetY + 0.35, root.Position.Z), Vector3.new(0, -1, 0), rayParams)
+    return floor ~= nil and floor.Normal.Y > 0.25 and math.abs(floor.Position.Y - feetY) <= 0.45
+end
 -- A normal recovery/emote jump submits one native input without taking ownership
 -- of navigation flight, changing motion properties, or applying an airborne boost.
 function FH.NormalJump(hum)
@@ -3527,13 +3589,13 @@ function FH.NormalJump(hum)
         or hum.PlatformStand
         or Ctl.On()
         or Fly.Active
-        or hum.FloorMaterial == Enum.Material.Air
         or now - FH.LastJump < 0.5
         or FH.JumpFlight
         or FH.Jmp
         or FH.IsHacking(FH.Motion and FH.Motion.token)
         or UserInputService:GetFocusedTextBox()
         or UserInputService:IsKeyDown(Enum.KeyCode.Space)
+        or not FH.TakeoffSupported(hum, hum.RootPart)
     then
         return false
     end
@@ -3569,7 +3631,14 @@ function FH.ConfirmNormalTakeoff(hum, root, token)
     then
         return false
     end
-    local ticket = { hum = hum, root = root, token = token, pos = root.Position, character = LocalPlayer.Character }
+    local ticket = {
+        hum = hum,
+        root = root,
+        token = token,
+        pos = root.Position,
+        character = LocalPlayer.Character,
+        airAtStart = hum.FloorMaterial == Enum.Material.Air,
+    }
     FH.NormalConfirm = ticket
     task.delay(0.18, function()
         if FH.NormalConfirm ~= ticket then return end
@@ -3584,7 +3653,8 @@ function FH.ConfirmNormalTakeoff(hum, root, token)
             or hum.Health <= 0
             or hum.Sit
             or hum.PlatformStand
-            or hum.FloorMaterial == Enum.Material.Air
+            or (hum.FloorMaterial == Enum.Material.Air and not ticket.airAtStart)
+            or not FH.TakeoffSupported(hum, root)
             or root.Position.Y > ticket.pos.Y + 0.05
             or root.AssemblyLinearVelocity.Y > 1
             or Ctl.On()
@@ -3610,7 +3680,13 @@ function FH.ConfirmNormalTakeoff(hum, root, token)
             return
         end
         local ok, state = pcall(function() return hum:GetState() end)
-        if not ok or state == Enum.HumanoidStateType.Jumping or state == Enum.HumanoidStateType.Freefall then return end
+        if
+            not ok
+            or state == Enum.HumanoidStateType.Jumping
+            or (state == Enum.HumanoidStateType.Freefall and not ticket.airAtStart)
+        then
+            return
+        end
         pcall(function() hum:ChangeState(Enum.HumanoidStateType.Jumping) end)
     end)
     return true
@@ -3622,7 +3698,7 @@ function FH.NoteNormalTakeoff()
     if not ticket or ticket.started then return end
     local hum, root = ticket.hum, ticket.root
     if
-        hum.FloorMaterial == Enum.Material.Air
+        (hum.FloorMaterial == Enum.Material.Air and not ticket.airAtStart)
         or root.Position.Y > ticket.pos.Y + 0.05
         or root.AssemblyLinearVelocity.Y > 1
     then
@@ -3630,7 +3706,13 @@ function FH.NoteNormalTakeoff()
         return
     end
     local ok, state = pcall(function() return hum:GetState() end)
-    if ok and (state == Enum.HumanoidStateType.Jumping or state == Enum.HumanoidStateType.Freefall) then
+    if
+        ok
+        and (
+            state == Enum.HumanoidStateType.Jumping
+            or (state == Enum.HumanoidStateType.Freefall and not ticket.airAtStart)
+        )
+    then
         ticket.started = true
     end
 end
@@ -3896,7 +3978,6 @@ function FH.StairJumpStep()
         or hum.Health <= 0
         or hum.Sit
         or hum.PlatformStand
-        or hum.FloorMaterial == Enum.Material.Air
         or FH.JumpFlight
         or FH.Jmp
         or now - FH.LastJump < 0.55
@@ -3914,6 +3995,7 @@ function FH.StairJumpStep()
         or AR.KeyDown
         or TR.Held
         or TR.KeyDown
+        or not FH.TakeoffSupported(hum, root)
     then
         return false
     end
@@ -3924,7 +4006,7 @@ function FH.StairJumpStep()
         and recovery.hum == hum
         and recovery.root == root
         and now - recovery.seen <= 0.7
-        and (recovery.escape or now - recovery.at >= 0.8)
+        and (recovery.escape or (recovery.stairAttempts or 0) >= 3)
     then
         -- A hop without forward progress must hand back to sideways routing
         -- instead of starting another flight on every landing indefinitely.
@@ -3944,6 +4026,9 @@ function FH.StairJumpStep()
         feetY = feetY,
     }
     FH.ConfirmNormalTakeoff(hum, root, motion.token)
+    if recovery and recovery.token == motion.token and recovery.hum == hum and recovery.root == root then
+        recovery.stairAttempts = (recovery.stairAttempts or 0) + 1
+    end
     return true
 end
 -- Periodic Space uses the event-maintained computer cache. Read positions at
@@ -4085,6 +4170,20 @@ function FH.TryJump(hum, root, aim, feetY, kind, sill)
         or not aim
         or hum.Health <= 0
         or hum.Sit
+        or hum.PlatformStand
+        or Ctl.On()
+        or Fly.Active
+        or EM.ComboState
+        or UserInputService:GetFocusedTextBox()
+        or FH.IsWorking(FH.Motion and FH.Motion.token)
+        or FH.IsHacking(FH.Motion and FH.Motion.token)
+        or FH.True(LocalPlayer, FH.CAP)
+        or FH.True(LocalPlayer, FH.RAG)
+        or (Follow.InputOwner == (FH.Motion and FH.Motion.token) and (Follow.Held or Follow.KeyDown))
+        or AR.Held
+        or AR.KeyDown
+        or TR.Held
+        or TR.KeyDown
         or hum.FloorMaterial == Enum.Material.Air
         or os.clock() - FH.LastJump < 0.5
     then
@@ -4126,6 +4225,7 @@ function FH.TryJump(hum, root, aim, feetY, kind, sill)
     -- A refused jump must not restart movement while waiting for its cooldown.
     if not FH.Jump(hum, kind == "jump2" or (sill or 0) > Follow.DoubleFrom) then return false end
     hum:MoveTo(aim)
+    FH.ConfirmNormalTakeoff(hum, root, FH.Motion and FH.Motion.token)
     return true
 end
 function FH.Unstick(hum, root, token, goal, dur)
@@ -4195,15 +4295,16 @@ function FH.Unstick(hum, root, token, goal, dur)
         task.wait(0.04)
     end
 end
-function FH.Ground(pos)
-    local r = Workspace:Raycast(pos + Vector3.new(0, 3, 0), Vector3.new(0, -40, 0), rayParams)
+function FH.Ground(pos, settings)
+    local params = settings or rayParams
+    local r = Workspace:Raycast(pos + Vector3.new(0, 3, 0), Vector3.new(0, -40, 0), params)
     -- A raised sample can start above a low ceiling. Never turn that ceiling
     -- into the destination floor for a root/trigger underneath it.
     if r and r.Position.Y > pos.Y + 0.75 then
-        r = Workspace:Raycast(pos + Vector3.new(0, 0.5, 0), Vector3.new(0, -40, 0), rayParams)
+        r = Workspace:Raycast(pos + Vector3.new(0, 0.5, 0), Vector3.new(0, -40, 0), params)
         if r and r.Position.Y > pos.Y + 0.5 then r = nil end
     end
-    return r and (r.Position + Vector3.new(0, 0.5, 0)) or pos
+    return r and (r.Position + Vector3.new(0, 0.5, 0)) or pos, r
 end
 function FH.Sight(rp, goal) return Workspace:Raycast(rp, goal - rp, rayParams) == nil end
 -- A nearby target can still be on the far side of a wall. Sample the body,
@@ -7350,8 +7451,11 @@ function Follow.PathIndex(wps, rp, feetY, bodyClear)
     for i = 2, #wps do
         local point = wps[i].Position
         local distance = (point - feet).Magnitude
-        if distance < closest and math.abs(point.Y - feetY) < Follow.MaxDY then
-            local clear, jumps = FH.Line(rp, point, feetY, point.Y)
+        if distance < closest then
+            -- Height alone cannot reject a supported staircase/ramp. Trace
+            -- the rise to the waypoint, but require its actual landing floor:
+            -- sharing X/Z with an upstairs point is not a clear route entry.
+            local clear, jumps = FH.Line(rp, point, feetY, point.Y, 1.5)
             -- Do not adopt beyond a still-untraversed window/gap jump.
             if
                 clear
@@ -7370,17 +7474,15 @@ function Follow.PathIndex(wps, rp, feetY, bodyClear)
     end
     if not index and bodyClear and wps[2] then
         local point = wps[2].Position
-        if math.abs(point.Y - feetY) < Follow.MaxDY then
-            local clear = FH.Line(rp, point, feetY, point.Y)
-            -- The first route leg may need a jump even on a native Walk stair
-            -- waypoint. Retain that verified entry without skipping later jumps.
-            if
-                clear
-                and not FH.LaneRejected(rp, point, feetY)
-                and Follow.PlanClear(rp, point, feetY, nil, nil, nil, FH.BodyRadius())
-            then
-                index = 2
-            end
+        local clear = FH.Line(rp, point, feetY, point.Y, 1.5)
+        -- The first route leg may need a jump even on a native Walk stair
+        -- waypoint. Retain that verified entry without skipping later jumps.
+        if
+            clear
+            and not FH.LaneRejected(rp, point, feetY)
+            and Follow.PlanClear(rp, point, feetY, nil, nil, nil, FH.BodyRadius())
+        then
+            index = 2
         end
     end
     return index
@@ -7508,6 +7610,29 @@ function Follow.AirClear(hum, root, point, reachLimit)
         end
     end
     return true
+end
+-- Root/trigger heights can differ on the same floor, or nearly match across
+-- two floors. Only a real supporting floor can confirm arrival/contact.
+function Follow.GoalOnFloor(hum, root, goal, ignoreModel)
+    if not (hum and root and goal) then return false end
+    local params = rayParams
+    if ignoreModel then
+        FH.ApproachRays = FH.ApproachRays or setmetatable({}, { __mode = "k" })
+        local cached = FH.ApproachRays[ignoreModel]
+        if not cached or cached.filterAt ~= rayFilterAt then
+            params = RaycastParams.new()
+            params.FilterType = Enum.RaycastFilterType.Exclude
+            params.RespectCanCollide = true
+            local exclude = table.clone(rayParams.FilterDescendantsInstances)
+            exclude[#exclude + 1] = ignoreModel
+            params.FilterDescendantsInstances = exclude
+            cached = { params = params, filterAt = rayFilterAt }
+            FH.ApproachRays[ignoreModel] = cached
+        end
+        params = cached.params
+    end
+    local ground, hit = FH.Ground(goal, params)
+    return hit ~= nil and hit.Normal.Y > 0.6 and math.abs(ground.Y - 0.5 - FH.Feet(hum, root)) <= 1.5
 end
 function Follow.WalkTo(token, getGoal, stopDist, abort, opts)
     opts = opts or {}
@@ -8019,7 +8144,12 @@ function Follow.WalkTo(token, getGoal, stopDist, abort, opts)
             reset()
             continue
         end
-        if flatDist <= sd and dyg < Follow.MaxDY and FH.ApproachClear(rp, goal, opts.approachModel) then
+        if
+            flatDist <= sd
+            and dyg < Follow.MaxDY
+            and Follow.GoalOnFloor(hum, root, goal, opts.approachModel)
+            and FH.ApproachClear(rp, goal, opts.approachModel)
+        then
             if not (keep and flatDist > 5 and keep()) then return finish("arrived", true) end
         end
         if job and not job.done and now - job.at > 8 then return finish("timeout", true) end
@@ -8038,7 +8168,7 @@ function Follow.WalkTo(token, getGoal, stopDist, abort, opts)
                     local groundY = FH.Ground(goal).Y - 0.5
                     local fromY = j.res.mode == "direct" and feetY or from.Y
                     fresh = (j.res.mode ~= "direct" or dyg < Follow.MaxDY)
-                        and FH.Line(from, goal, fromY, groundY)
+                        and FH.Line(from, goal, fromY, groundY, 1.5)
                         and clearLane(from, goal, fromY)
                 end
             end
@@ -8077,7 +8207,7 @@ function Follow.WalkTo(token, getGoal, stopDist, abort, opts)
             if mode == "direct" then
                 if now - chkAt > 0.25 then
                     chkAt = now
-                    local ok = FH.Line(rp, goal, feetY, FH.Ground(goal).Y - 0.5)
+                    local ok = FH.Line(rp, goal, feetY, FH.Ground(goal).Y - 0.5, 1.5)
                     if not ok then need = true end
                 end
             else
@@ -8101,7 +8231,7 @@ function Follow.WalkTo(token, getGoal, stopDist, abort, opts)
                 and flatDist < 70
                 and (not stableFollow or dyg < Follow.MaxDY)
             then
-                lineOk, jumps, big = FH.Line(rp, goal, feetY, FH.Ground(goal).Y - 0.5)
+                lineOk, jumps, big = FH.Line(rp, goal, feetY, FH.Ground(goal).Y - 0.5, 1.5)
             end
             lineOk = lineOk and clearLane(rp, goal, feetY)
             if lineOk and (jumps == 0 or evade or (windows and jumps <= 3 and big <= 1)) then
@@ -8903,7 +9033,13 @@ function Follow.Chase(token, getGoal, stopDist, abort, keep)
         local flatDist = Flat(goal - rp).Magnitude
         local dyg = math.abs(goal.Y - rp.Y)
         -- khác tầng / quá xa: để pathfinding lo
-        if flatDist > 90 or dyg > Follow.MaxDY + 2 then return finish("trapped", false) end
+        if
+            flatDist > 90
+            or dyg > Follow.MaxDY + 2
+            or (hum.FloorMaterial ~= Enum.Material.Air and dyg > 1.5 and not Follow.GoalOnFloor(hum, root, goal))
+        then
+            return finish("trapped", false)
+        end
         local sd = type(stopDist) == "function" and stopDist() or stopDist
         FH.RefreshFilter()
         FH.Tick(hum, root)
@@ -8916,6 +9052,7 @@ function Follow.Chase(token, getGoal, stopDist, abort, keep)
         if
             flatDist <= sd
             and dyg < Follow.MaxDY
+            and Follow.GoalOnFloor(hum, root, goal)
             and (sd <= 3.5 or flatDist <= 2.5 or sd >= 20 or FH.Sight(rp, goal))
         then
             if not (keep and flatDist > 5 and keep()) then return finish("arrived", true) end
@@ -8943,7 +9080,7 @@ function Follow.Chase(token, getGoal, stopDist, abort, keep)
         -- đường thẳng tới mục tiêu có đi được không (cho phép nhảy qua vật thấp)
         if now - lineAt > 0.25 and not jumping then
             lineAt = now
-            local ok, jumps, big = FH.Line(rp, goal, feetY, FH.Ground(goal).Y - 0.5)
+            local ok, jumps, big = FH.Line(rp, goal, feetY, FH.Ground(goal).Y - 0.5, 1.5)
             local clear = ok and jumps <= 3 and (big == 0 or big == 1) and clearLane(rp, goal, feetY)
             if stable then
                 clearProbes = clear and math.min(clearProbes + 1, 2) or 0
@@ -9579,7 +9716,7 @@ function Follow.Main(token, player)
                     return true
                 end
                 return false
-            end, { maxTime = 30, nearOk = 3.2 })
+            end, { maxTime = 30, nearOk = 3.2, approachModel = comp })
             if stop() then
                 Follow.Release(token)
                 return
@@ -9587,7 +9724,11 @@ function Follow.Main(token, player)
             if walkLost then continue end
 
             local mr = myRoot()
-            local near = mr and Flat(mr.Position - trig.Position).Magnitude <= 6
+            local near = mr
+                and Flat(mr.Position - trig.Position).Magnitude <= 6
+                and math.abs(mr.Position.Y - trig.Position.Y) <= 3.6
+                and Follow.GoalOnFloor(GetHumanoid(), mr, trig.Position, comp)
+                and FH.ApproachClear(mr.Position, trig.Position, comp)
             if not near then
                 if res == "nopath" or res == "stuck" or res == "timeout" then
                     hackSkip[comp] = os.clock() + 10
@@ -9612,6 +9753,13 @@ function Follow.Main(token, player)
                 local r2 = hum and hum.RootPart
                 if hum and r2 then
                     local offset = trig.Position - r2.Position
+                    -- A fall or floor change requires navigation again. A raw
+                    -- vertical Move cannot find the stairs back to this trigger.
+                    if math.abs(offset.Y) > 3.6 or not Follow.GoalOnFloor(hum, r2, trig.Position, comp) then
+                        Follow.Release(token)
+                        routeLost = true
+                        break
+                    end
                     local dist = math.abs(offset.Y) <= 3.6 and Flat(offset).Magnitude or math.huge
                     if FH.CanHold(st, dist, 1.5, 4.2) then
                         FH.Move(token, hum, r2.Position)
@@ -9968,7 +10116,7 @@ function Follow.Main(token, player)
                 end
             end
         end
-        local blocked = not FH.ApproachClear(rp, tp)
+        local blocked = not FH.ApproachClear(rp, tp) or not Follow.GoalOnFloor(hum, root, tp)
         local far
         if danger then
             far = dist > safe + 4 or math.abs(tp.Y - rp.Y) > Follow.MaxDY or blocked
@@ -9981,7 +10129,14 @@ function Follow.Main(token, player)
             if targetCaptured() and (nearestPod(player) or nearestPod(nil)) then return true end
             if targetDanger() then
                 local r, m = troot(), myRoot()
-                if r and m and Flat(r.Position - m.Position).Magnitude <= safe then return true end
+                if
+                    r
+                    and m
+                    and Flat(r.Position - m.Position).Magnitude <= safe
+                    and Follow.GoalOnFloor(GetHumanoid(), m, r.Position)
+                then
+                    return true
+                end
                 return false
             end
             if FH.Endgame.on then return false end
@@ -18092,13 +18247,7 @@ EM.Groups = {
             Name = "Sword Pump Up",
             Layers = { { Id = "85723345", Loop = true, Speed = 8, Weight = 1.00 } },
         },
-        {
-            Name = "Nonchalant",
-            Layers = {
-                { Id = "129967390", Time = 0.22, Weight = 1.00 },
-                { Id = "33796059", Time = 3.03, Weight = 0.60 },
-            },
-        },
+        { Name = "Circle", Type = "Circle" },
         { Name = "Walk Loop", Layers = { { Id = "180426354", Loop = true, Weight = 1.00 } } },
     },
     {
@@ -18147,7 +18296,10 @@ function EM.RestoreProperty(state, name)
         then
             -- Crawling or capture may already have written its own speed/rotation.
             -- Release only the combo's value during a pause; ordinary Stop restores its snapshot.
-            if not state.restoreForCrawl or saved.hum[saved.property] == (saved.applied or saved.value) then
+            if
+                not (state.restoreForCrawl or state.kind == "circle")
+                or saved.hum[saved.property] == (saved.applied or saved.value)
+            then
                 saved.hum[saved.property] = saved.value
             end
         end
@@ -18185,7 +18337,12 @@ function EM.Stop()
     EM.Disconnect("HoldConnection")
     EM.Disconnect("StoppedConnection")
     EM.Disconnect("DeathConnection")
+    if EM.CircleBound then
+        EM.CircleBound = nil
+        pcall(function() RunService:UnbindFromRenderStep("NovaCircleEmote") end)
+    end
     local track, anim, state = EM.CurrentTrack, EM.CurrentAnimation, EM.ComboState
+    local circleOwned = state and state.kind == "circle" and FH.Motion.token == state.motion
     local layers = EM.LayerState
     EM.LayerState = nil
     if layers then
@@ -18200,6 +18357,9 @@ function EM.Stop()
     EM.CurrentTrack, EM.CurrentAnimation, EM.CurrentData, EM.ComboState, EM.PausedState = nil, nil, nil, nil, nil
     EM.Frozen = false
     EM.RestoreCombo(state)
+    if circleOwned and not Ctl.On() and not Fly.Active then
+        pcall(function() state.hum:Move(Vector3.new(0, 0, 0), false) end)
+    end
     if state then state.restoreToken = nil end
     EM.DisposeClip(track, anim)
     EM.Changed()
@@ -18245,7 +18405,11 @@ function EM.Crawling()
     return not UserInputService:GetFocusedTextBox()
         and (UserInputService:IsKeyDown(Enum.KeyCode.LeftShift) or UserInputService:IsKeyDown(Enum.KeyCode.RightShift))
 end
-function EM.PauseRequired() return EM.Crawling() or FH.True(LocalPlayer, FH.CAP) end
+function EM.PauseRequired()
+    return EM.Crawling()
+        or FH.True(LocalPlayer, FH.CAP)
+        or EM.CurrentData and EM.CurrentData.Type == "Circle" and EM.CircleBlocked(GetHumanoid(), EM.ComboState)
+end
 function EM.HandleStopped(generation)
     if EM.Token ~= generation then return end
     -- Capture can stop a track before the next observer tick. Preserve the
@@ -18443,6 +18607,7 @@ function EM.PlayLayers(data)
     return true
 end
 function EM.ComboValid(state)
+    if state.kind == "circle" then return EM.CircleValid(state) end
     if
         not unloaded
         and EM.ComboState == state
@@ -18607,6 +18772,240 @@ function EM.PlayCombo(data)
     end)
     return true
 end
+EM.CircleRadius, EM.CircleSpeed = 6, 48
+function EM.CircleTarget()
+    local root, best, bestRoot, bestHum, bestDistance = RootNow(), nil, nil, nil, math.huge
+    if not root then return nil end
+    for _, player in ipairs(Players:GetPlayers()) do
+        local character = player ~= LocalPlayer and player.Parent == Players and player.Character
+        local targetRoot = character and character:FindFirstChild("HumanoidRootPart")
+        local targetHum = character and character:FindFirstChildOfClass("Humanoid")
+        if targetRoot and targetHum and targetHum.Health > 0 and not FH.True(player, FH.CAP) then
+            local distance = (targetRoot.Position - root.Position).Magnitude
+            if distance < bestDistance or distance == bestDistance and player.UserId < best.UserId then
+                best, bestRoot, bestHum, bestDistance = player, targetRoot, targetHum, distance
+            end
+        end
+    end
+    return best, bestRoot, bestHum
+end
+function EM.CircleBlocked(hum, state)
+    return not hum
+        or hum.Health <= 0
+        or hum.Sit
+        or hum.PlatformStand
+        or hum.FloorMaterial == Enum.Material.Air
+        or hum.WalkSpeed <= 0
+        or Ctl.On()
+        or Fly.Active
+        or UserInputService:GetFocusedTextBox() ~= nil
+        or AH.Down()
+        or FH.IsHacking(FH.Motion.token)
+        or Follow.Held
+        or Follow.KeyDown
+        or AR.Held
+        or AR.KeyDown
+        or TR.Held
+        or TR.KeyDown
+        or CB.Active and Cmd.ActiveId ~= nil and Cmd.ActiveId == Cmd.Token
+        or AR.Request ~= nil and AR.Request.userRequested == true
+        or os.clock() < (FH.PrioUntil or 0) and (not state or FH.PrioUntil ~= state.prioApplied)
+end
+function EM.CircleValid(state)
+    if
+        unloaded
+        or EM.ComboState ~= state
+        or EM.Token ~= state.generation
+        or LocalPlayer.Character ~= state.character
+        or GetHumanoid() ~= state.hum
+        or RootNow() ~= state.root
+        or state.root.Parent ~= state.character
+        or state.hum.Parent ~= state.character
+        or state.hum.Health <= 0
+    then
+        return false
+    end
+    if EM.PauseRequired() then
+        EM.PauseForCrawl()
+        return false
+    end
+    return true
+end
+function EM.CircleClear(state, goal)
+    local root, hum = state.root, state.hum
+    local delta, rp = Flat(goal - root.Position), root.Position
+    if delta.Magnitude < 0.1 then return true end
+    FH.RefreshFilter()
+    local dir, reach = delta.Unit, math.min(delta.Magnitude, 3.5)
+    local across, radius = Vector3.new(-dir.Z, 0, dir.X), FH.BodyRadius(root)
+    local feetY = FH.Feet(hum, root)
+    local head = state.character:FindFirstChild("Head")
+    local bodyHeight = math.max(Follow.BodyH or 4.4, root.Position.Y - feetY + 2)
+    if head then bodyHeight = math.max(bodyHeight, head.Position.Y + head.Size.Y * 0.5 - feetY) end
+    -- Sweep the full body, including narrow bars between the ray heights.
+    if Workspace.Blockcast then
+        local body = CFrame.new(Vector3.new(rp.X, feetY + bodyHeight * 0.5 + 0.1, rp.Z))
+        if Workspace:Blockcast(body, Vector3.new(radius * 2, bodyHeight - 0.2, radius * 2), dir * reach, rayParams) then
+            return false
+        end
+    end
+    -- A small arc ahead is enough at 48 studs/s. Body width and supported floor
+    -- are checked at a bounded 20Hz; Circle never clips or teleports past a wall.
+    for _, off in ipairs({ 0, radius, -radius }) do
+        for _, height in ipairs({ 0.7, 2.7, bodyHeight - 0.15 }) do
+            local origin = Vector3.new(rp.X, feetY + height, rp.Z) + across * off
+            if Workspace:Raycast(origin, dir * reach, rayParams) then return false end
+        end
+        for _, fraction in ipairs({ 0.5, 1 }) do
+            local point = rp + across * off + dir * reach * fraction
+            local floor =
+                Workspace:Raycast(Vector3.new(point.X, feetY + 1.5, point.Z), Vector3.new(0, -4, 0), rayParams)
+            if not floor or floor.Normal.Y < 0.65 or math.abs(floor.Position.Y - feetY) > 1 then return false end
+        end
+    end
+    return true
+end
+function EM.CircleHalt(state)
+    if FH.Motion.token ~= state.motion then return end
+    FH.Motion.aim, FH.Motion.sentAim, FH.Motion.sentAt = state.root.Position, state.root.Position, os.clock()
+    state.hum:MoveTo(state.root.Position)
+    state.hum:Move(Vector3.new(0, 0, 0), false)
+end
+function EM.CircleStep(state)
+    if not EM.CircleValid(state) then
+        if EM.ComboState == state then EM.Stop() end
+        return
+    end
+    if not EM.ComboLease(state) then
+        EM.PauseForCrawl()
+        return
+    end
+    if state.hum.WalkSpeed ~= state.walk.applied then
+        -- The game changed movement (for example crawl/capture). Keep that
+        -- value; a resumed Circle takes a fresh snapshot after the game settles.
+        EM.PauseForCrawl()
+        return
+    end
+    if
+        state.target.Parent ~= Players
+        or state.target.Character ~= state.targetRoot.Parent
+        or state.targetHum.Parent ~= state.target.Character
+        or state.targetHum.Health <= 0
+        or FH.True(state.target, FH.CAP)
+    then
+        state.target, state.targetRoot, state.targetHum = EM.CircleTarget()
+        if not state.target then
+            EM.Stop()
+            EM.LastError = "No nearby player for Circle"
+            EM.Changed()
+            return
+        end
+        state.floorAt, state.probeAt = nil, nil
+    end
+    local rp, center, now = state.root.Position, state.targetRoot.Position, os.clock()
+    if
+        now >= (state.floorAt or 0)
+        or not state.floorCenter
+        or math.abs(center.Y - state.floorCenter.Y) > 0.5
+        or Flat(center - state.floorCenter).Magnitude > 2
+    then
+        state.floorAt, state.floorCenter = now + 0.1, center
+        state.targetFloor = Follow.GoalOnFloor(state.hum, state.root, center, state.target.Character)
+    end
+    if not state.targetFloor then
+        EM.Stop()
+        EM.LastError = "Circle target is on another floor"
+        EM.Changed()
+        return
+    end
+    local radial = Flat(rp - center)
+    if radial.Magnitude < 0.1 then radial = Vector3.new(1, 0, 0) end
+    local unit = radial.Unit
+    local angle = radial.Magnitude > EM.CircleRadius + 1.5 and 0 or state.direction * 0.45
+    local arc = Vector3.new(
+        unit.X * math.cos(angle) - unit.Z * math.sin(angle),
+        0,
+        unit.X * math.sin(angle) + unit.Z * math.cos(angle)
+    )
+    local goal = Vector3.new(center.X, rp.Y, center.Z) + arc * EM.CircleRadius
+    local heading = Flat(goal - rp)
+    if
+        now >= (state.probeAt or 0)
+        or not state.probeFrom
+        or Flat(rp - state.probeFrom).Magnitude > 2
+        or heading.Magnitude > 0.1 and state.probeDir and heading.Unit:Dot(state.probeDir) < 0.9
+    then
+        state.probeAt = now + 0.05
+        state.probeFrom, state.probeDir = rp, heading.Magnitude > 0.1 and heading.Unit or nil
+        state.clear = EM.CircleClear(state, goal)
+        if not state.clear and now >= (state.reverseAt or 0) then
+            state.direction, state.reverseAt = -state.direction, now + 0.5
+            state.probeAt = now
+        end
+    end
+    if not state.clear then
+        EM.CircleHalt(state)
+        return
+    end
+    local motion = FH.Motion
+    motion.aim = goal
+    if not motion.sentAim or (goal - motion.sentAim).Magnitude >= 0.7 or now - motion.sentAt >= 0.15 then
+        motion.sentAim, motion.sentAt = goal, now
+        state.hum:MoveTo(goal)
+    end
+    local desired = Flat(goal - rp)
+    state.hum:Move(desired.Magnitude > 0.1 and desired.Unit or Vector3.new(0, 0, 0), false)
+end
+function EM.PlayCircle(data)
+    local hum, root = GetHumanoid(), RootNow()
+    if not hum or not root or hum.Health <= 0 then return false end
+    if EM.CircleBlocked(hum) then return EM.PauseForCrawl(data) end
+    local target, targetRoot, targetHum = EM.CircleTarget()
+    if not target or not Follow.GoalOnFloor(hum, root, targetRoot.Position, target.Character) then
+        EM.LastError = target and "Circle target is on another floor" or "No nearby player for Circle"
+        EM.Changed()
+        return false
+    end
+    if Speed.ClearRescue then Speed.ClearRescue() end
+    local state = {
+        kind = "circle",
+        hum = hum,
+        root = root,
+        character = LocalPlayer.Character,
+        generation = EM.Token,
+        target = target,
+        targetRoot = targetRoot,
+        targetHum = targetHum,
+        direction = 1,
+        pauseBefore = Follow.PauseUntil,
+        prioBefore = FH.PrioUntil,
+    }
+    state.motion = { owner = "command", priority = 95, ok = function() return EM.CircleValid(state) end }
+    EM.ComboState, EM.CurrentData, EM.LastError = state, data, nil
+    if not EM.ComboLease(state) then
+        EM.Stop()
+        return false
+    end
+    FH.Jmp, FH.JumpFlight = nil, nil
+    pcall(Follow.Release)
+    pcall(AH.ReleaseTap)
+    pcall(AR.Release)
+    pcall(TR.Release)
+    EM.SaveProperty(state, "walk", hum, "WalkSpeed", EM.CircleSpeed)
+    EM.WatchDeath(hum, state.generation)
+    EM.WatchCrawl()
+    EM.CircleBound = true
+    RunService:BindToRenderStep("NovaCircleEmote", Enum.RenderPriority.Input.Value + 2, function()
+        local ok = pcall(EM.CircleStep, state)
+        if not ok and EM.ComboState == state then
+            EM.Stop()
+            EM.LastError = "Circle interrupted"
+            EM.Changed()
+        end
+    end)
+    EM.Changed()
+    return true
+end
 function EM.ComboBlocked(hum)
     return Ctl.On()
         or Fly.Active
@@ -18636,6 +19035,7 @@ function EM.Start(data, position)
         if paused and not EM.PauseRequired() then EM.PausedState.resumeAt = EM.CrawlRestoreAt end
         return paused
     end
+    if data.Type == "Circle" then return EM.PlayCircle(data) end
     if data.Type == "Combo" then return EM.PlayCombo(data) end
     if data.Layers then return EM.PlayLayers(data) end
     return EM.Play(data, position)
