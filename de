@@ -2287,7 +2287,7 @@ Follow.DoubleFrom = 0.9
 Follow.HackSendResult = true
 Follow.HackMax = 45 -- giữ E hack 1 máy tối đa bấy nhiêu giây
 Follow.StandMax = 3 -- không tiến bộ khi farm: thử thoát kẹt, trừ lúc thực sự hack/mở exit
-Follow.ExitTeamRange = 18 -- cùng cửa, cùng tầng; không tự thoát chỉ vì hết giờ chờ
+Follow.ExitWait = 60 -- đứng đợi survivor khác ở cửa exit tối đa bấy nhiêu giây
 Follow.HelpDist = 3.6
 Follow.Held = nil
 Follow.Rescuing = false
@@ -2481,79 +2481,55 @@ function FH.StallJumpStep()
     state.jumped = true
     return true
 end
--- Measure horizontal progress while the owning task keeps issuing movement.
--- A failed jump commits one safe sideways lane before asking for a new route.
+-- Measure actual progress even when a blocked MoveTo keeps renewing its lease.
+-- The owning task issues the recovery move itself, so no second loop can fight it.
 function FH.RecoveryAim(token, hum, goal, intentGoal)
     local root = hum.RootPart
     local desired = intentGoal or goal
-    if
-        not root
-        or not desired
-        or unloaded
-        or hum.Health <= 0
-        or hum.Sit
-        or hum.PlatformStand
-        or Ctl.On()
-        or Fly.Active
-        or EM.ComboState
-        or UserInputService:GetFocusedTextBox()
-        or not FH.MotionAvailable(token)
-        or FH.True(LocalPlayer, FH.CAP)
-        or FH.True(LocalPlayer, FH.RAG)
-        or FH.IsWorking(token)
-        or FH.IsHacking(token)
-        or (Follow.InputOwner == token and (Follow.Held or Follow.KeyDown))
-        or AR.Held
-        or AR.KeyDown
-        or TR.Held
-        or TR.KeyDown
-    then
+    if not root or not desired or unloaded or Ctl.On() or Fly.Active or hum.Sit or FH.IsWorking(token) then
         FH.MoveWatch = nil
         return goal
     end
     local rp, now = root.Position, os.clock()
     local dv = Flat(desired - rp)
-    if dv.Magnitude <= 0.8 and math.abs(desired.Y - rp.Y) <= Follow.MaxDY then
+    if
+        dv.Magnitude <= 2.5
+        and math.abs(desired.Y - rp.Y) <= Follow.MaxDY
+        and (type(token) ~= "number" or FH.ApproachClear(rp, desired))
+    then
         FH.MoveWatch = nil
         return goal
     end
     local state = FH.MoveWatch
-    if
-        not state
-        or state.token ~= token
-        or state.root ~= root
-        or state.hum ~= hum
-        or now - state.seen > 0.7
-        or (intentGoal and state.intentGoal and Flat(intentGoal - state.intentGoal).Magnitude > 6)
-    then
-        state = { token = token, root = root, hum = hum, anchor = rp, at = now, seen = now, lastSide = 1 }
+    if not state or state.token ~= token or state.root ~= root or now - state.seen > 0.7 then
+        state = { token = token, root = root, anchor = rp, at = now, seen = now, lastSide = 1 }
         FH.MoveWatch = state
     end
     state.seen = now
-    if intentGoal then state.intentGoal = intentGoal end
     local attempted = Flat(goal - rp)
     if type(token) == "number" and attempted.Magnitude > 0.8 then
-        if state.dir and state.dir:Dot(attempted.Unit) < 0.65 and not state.turnGrace and not state.escape then
+        if state.dir and state.dir:Dot(attempted.Unit) < 0.65 and not state.turnGrace then
             state.turnGrace, state.graceUntil = true, now + 0.3
         end
         state.dir = attempted.Unit
+    end
+    -- Vertical takeoff is not forward progress, and recovery must wait for landing.
+    if hum.FloorMaterial == Enum.Material.Air then
+        state.anchor, state.at = rp, now
+        state.turnGrace, state.graceUntil = nil, nil
+        return goal
     end
     if Flat(rp - state.anchor).Magnitude >= 0.8 then
         state.anchor, state.at = rp, now
         state.turnGrace, state.graceUntil = nil, nil
     end
-    -- Vertical bouncing does not restart the horizontal stall timer. Keep the
-    -- committed destination during a jump, then check its lane after landing.
-    if hum.FloorMaterial == Enum.Material.Air then return state.escape or goal end
     local feetY = FH.Feet(hum, root)
     local function clear(point)
         local step = Flat(point - rp)
-        if step.Magnitude <= 0.8 then return true end
-        if FH.LaneRejected and FH.LaneRejected(rp, point, feetY) then return false end
+        if step.Magnitude <= 1.2 then return false end
         local dir, reach = step.Unit, math.min(step.Magnitude, 3.5)
         local across = Vector3.new(-dir.Z, 0, dir.X)
-        local radius = FH.BodyRadius(root)
-        for _, off in ipairs({ 0, radius * 0.5, -radius * 0.5, radius, -radius }) do
+        for _, off in ipairs({ 0, 0.75, -0.75 }) do
             local origin, floorY = rp + across * off, feetY
             for i = 0, 1 do
                 local floor, jump = FH.Seg(
@@ -2569,54 +2545,41 @@ function FH.RecoveryAim(token, hum, goal, intentGoal)
         end
         return true
     end
-    local function replan(point)
-        if FH.Motion.token == token then FH.Motion.replanToken = token end
-        FH.BanDirect, FH.GridBan = math.max(FH.BanDirect or 0, now + 1.2), 0
-        if point and FH.RejectLane then FH.RejectLane(token, hum, point) end
-    end
+    if not intentGoal then state.escape = nil end
     if state.escape then
-        if Flat(rp - state.escapeAnchor).Magnitude >= 0.35 then
-            state.escapeAnchor, state.escapeAt = rp, now
-        end
-        if Flat(state.escape - rp).Magnitude <= 0.8 then
-            state.escape, state.escapeUntil = nil, nil
-            state.anchor, state.at = rp, now
-            replan(nil)
-            return goal
-        end
-        if now < state.escapeUntil and now - state.escapeAt < 0.7 then
+        if now < state.escapeUntil and Flat(state.escape - rp).Magnitude > 1 then
             if now >= (state.escapeCheckAt or 0) then
-                state.escapeCheckAt = now + 0.25
-                FH.RefreshFilter()
+                state.escapeCheckAt = now + 0.1
                 state.escapeClear = clear(state.escape)
             end
             if state.escapeClear then return state.escape end
         end
-        local failed = state.escape
-        state.escape, state.escapeUntil = nil, nil
-        state.turnGrace, state.graceUntil = nil, nil
-        replan(failed)
-        -- A blocked side must not win the next pick just because its center
-        -- rays still pass. Mark it briefly and try the opposite side now.
-        if now - state.escapeAt >= 0.7 then FH.AddBad(failed, 4) end
-        state.at, state.anchor = now - 1.2, rp
+        state.escape = nil
     end
     if now - state.at < 1.2 or now < (state.graceUntil or 0) then return goal end
     state.at, state.anchor = now, rp
     state.turnGrace, state.graceUntil = nil, nil
+    local motion = FH.Motion
+    if motion.token == token then motion.replanToken = token end
+    FH.BanDirect, FH.GridBan = math.max(FH.BanDirect or 0, now + 1.2), 0
+    -- A planned waypoint owns its direction. Replan it instead of substituting
+    -- a side-step that could cut across the very wall the path avoids.
+    if not intentGoal then
+        if FH.RejectLane then FH.RejectLane(token, hum, goal) end
+        return goal
+    end
     FH.RefreshFilter()
     local forward = dv.Magnitude > 0.5 and dv or Flat(root.CFrame.LookVector)
     if forward.Magnitude < 0.1 then forward = Vector3.new(1, 0, 0) end
     forward = forward.Unit
     local side = Vector3.new(-forward.Z, 0, forward.X) * -state.lastSide
-    -- First walk sideways around trees/walls, instead of repeatedly jumping
-    -- into them. Probe a bounded set only when stalled, never each frame.
+    if dv.Magnitude > 0.5 then FH.AddBad(rp + forward * 3.2, 6) end
     local pick
     for _, dir in ipairs({
-        side,
-        -side,
         forward * 0.5 + side * 0.866,
         forward * 0.5 - side * 0.866,
+        side,
+        -side,
         -forward * 0.5 + side * 0.866,
         -forward * 0.5 - side * 0.866,
         -forward,
@@ -2627,23 +2590,14 @@ function FH.RecoveryAim(token, hum, goal, intentGoal)
             break
         end
     end
-    if not pick then
-        replan(goal)
-        return goal
-    end
-    -- Keep this one destination through normal waypoint updates and jumping.
-    -- Replan after the detour finishes or fails, not before it can be walked.
-    if FH.RejectLane then FH.RejectLane(token, hum, goal) end
-    if dv.Magnitude > 0.5 then FH.AddBad(rp + forward * 3.2, 6) end
+    if not pick then return goal end
     state.lastSide = Flat(pick - rp):Dot(Vector3.new(-forward.Z, 0, forward.X)) >= 0 and 1 or -1
-    state.escape, state.escapeUntil = pick, now + 1.8
-    state.escapeAnchor, state.escapeAt = rp, now
-    state.escapeCheckAt, state.escapeClear = now + 0.25, true
+    state.escape, state.escapeUntil = pick, now + 0.65
+    state.escapeCheckAt, state.escapeClear = now + 0.1, true
     return pick
 end
 function FH.Move(token, hum, goal, force, intentGoal)
     if not (hum and goal) or hum.Health <= 0 or Ctl.On() or Fly.Active or not FH.MotionAvailable(token) then
-        if FH.MoveWatch and FH.MoveWatch.token == token then FH.MoveWatch = nil end
         return false
     end
     FH.NoteStallIntent(token, hum, goal, intentGoal)
@@ -2668,8 +2622,7 @@ function FH.Move(token, hum, goal, force, intentGoal)
         end
         return true
     end
-    -- A rejected forward lane still needs its horizontal-progress watch;
-    -- recovery may safely choose a different lane before this final check.
+    if rejected(goal) then return false end
     goal = FH.RecoveryAim(token, hum, goal, intentGoal)
     if rejected(goal) then return false end
     local m, now = FH.Motion, os.clock()
@@ -3050,41 +3003,10 @@ function FH.GameInfo()
     if not FH.ValObjs or now - FH.ScanAt > 20 then
         FH.ScanAt = now
         local list = {}
-        local remaining
         for _, d in ipairs(RepStore:GetDescendants()) do
-            local name, parent = string.lower(d.Name), d.Parent
-            local stateContainer = parent
-                and parent.Parent == RepStore
-                and (
-                    parent.Name == "GameState"
-                    or parent.Name == "GameStats"
-                    or parent.Name == "RoundState"
-                    or parent.Name == "RoundStats"
-                )
-            local liveState = parent == RepStore or stateContainer
-            if
-                d:IsA("StringValue")
-                and liveState
-                and (
-                    name == "gamestatus"
-                    or name == "roundstatus"
-                    or name == "gamemessage"
-                    or name == "statusmessage"
-                    or name == "status"
-                )
-            then
-                list[#list + 1] = d
-            end
-            if
-                (d.Name == "ComputersLeft" or d.Name == "ComputersRemaining")
-                and (d:IsA("IntValue") or d:IsA("NumberValue"))
-                and liveState
-            then
-                remaining = d
-            end
+            if d:IsA("StringValue") then list[#list + 1] = d end
         end
         FH.ValObjs = list
-        FH.ComputersLeftValue = remaining
     end
     local exitTxt = false
     for _, v in ipairs(FH.ValObjs) do
@@ -3095,9 +3017,6 @@ function FH.GameInfo()
                     or string.find(t, "are open", 1, true)
                     or string.find(t, "is open", 1, true)
                     or string.find(t, "opened", 1, true)
-                    or string.find(t, "unlocked", 1, true)
-                    or string.find(t, "find an exit", 1, true)
-                    or string.find(t, "find the exit", 1, true)
                 local notYet = string.find(t, "will open", 1, true)
                     or string.find(t, "when ", 1, true)
                     or string.find(t, "until", 1, true)
@@ -3110,8 +3029,7 @@ function FH.GameInfo()
             end
         end
     end
-    local remaining = FH.ComputersLeftValue
-    FH.Info = { exitTxt = exitTxt, computersLeft = remaining and remaining.Parent and remaining.Value or nil }
+    FH.Info = { exitTxt = exitTxt }
     return FH.Info
 end
 function FH.DoorSig(door)
@@ -3142,7 +3060,6 @@ function FH.ExitDoorChanged()
     return false
 end
 function FH.ExitOpen()
-    if not FH.MatchOn() then return false end
     local E = FH.Endgame
     if E.on then
         if E.map == GetCurrentMap() then return true end
@@ -3153,18 +3070,13 @@ function FH.ExitOpen()
     FH.EndAt = now
     if not FH.MatchOn() then return false end
     -- The game's open-exit message is authoritative even with spare computers left.
-    local info = FH.GameInfo()
-    if info.exitTxt or info.computersLeft == 0 then
+    if FH.GameInfo().exitTxt then
         FH.SetEndgame("signal", false)
         return true
     end
     local total, undone = FH.UndoneCount()
     if total > 0 and undone == 0 then
         FH.SetEndgame("screens", false)
-        return true
-    end
-    if FH.AnyExitOpen() then
-        FH.SetEndgame("opened-door", false)
         return true
     end
     if FH.ExitDoorChanged() then
@@ -3208,7 +3120,7 @@ function FH.ExitArea(model)
             end
         end
     end
-    if best then return best.Position, best.Size, best end
+    if best then return best.Position end
     local c = HideTP.Bounds(model)
     return c
 end
@@ -3463,46 +3375,9 @@ function FH.JumpMoveStep()
     hum:Move(direction.Unit, false)
     motion.sentAt = os.clock()
 end
--- Roblox's ordinary input controller also writes Move(0) when no movement key
--- is held. Keep the leased direction after that update on the ground as well
--- as during native Space recovery; a cached MoveTo alone can be cancelled.
-function FH.GroundMoveStep()
-    local motion = FH.Motion
-    if not motion or motion.token == nil or not motion.aim or FH.JumpFlight then return end
-    local hum, root = GetHumanoid(), RootNow()
-    if
-        unloaded
-        or not hum
-        or not root
-        or motion.hum ~= hum
-        or hum.RootPart ~= root
-        or hum.Health <= 0
-        or hum.Sit
-        or hum.PlatformStand
-        or Ctl.On()
-        or Fly.Active
-        or EM.ComboState
-        or UserInputService:GetFocusedTextBox()
-        or not FH.MotionActive()
-        or FH.IsWorking(motion.token)
-        or FH.IsHacking(motion.token)
-        or FH.True(LocalPlayer, FH.CAP)
-        or FH.True(LocalPlayer, FH.RAG)
-        or (Follow.InputOwner == motion.token and (Follow.Held or Follow.KeyDown))
-        or AR.Held
-        or AR.KeyDown
-        or TR.Held
-        or TR.KeyDown
-    then
-        return
-    end
-    local direction = Flat(motion.aim - root.Position)
-    hum:Move(direction.Magnitude > 0.5 and direction.Unit or Vector3.new(0, 0, 0), false)
-end
 function FH.MotionStep()
     FH.StallJumpStep()
     FH.JumpMoveStep()
-    FH.GroundMoveStep()
 end
 RunService:BindToRenderStep("NovaJumpMove", Enum.RenderPriority.Input.Value + 1, function()
     local ok = pcall(FH.MotionStep)
@@ -3899,58 +3774,6 @@ function FH.DoorCanHold(g, trig, position, stand, feetY)
 end
 local FAST_H = { 0.7, 2.7, 4.7 }
 local SLOW_H = { 0.7, 1.7, 2.7, 3.7, 4.7, 5.7, 6.7, 7.7, 8.7 }
-local STAIR_H = { 1.1, 1.6, 2.3, 3.6, Follow.BodyH - 0.15 }
--- A long horizontal profile sees the upper risers of a staircase as one tall
--- obstacle. Trace small supported steps with body/head clearance instead; a
--- tree, closed door, unsupported ledge or low ceiling must still be rejected.
-function FH.StairLane(px, pz, dir, baseY, reach, settings)
-    if reach <= 0.1 or reach > 6.1 then return nil end
-    local params = settings or rayParams
-    local count = math.max(1, math.ceil(reach / 0.55))
-    local length, floorY, raised = reach / count, baseY, false
-    for i = 1, count do
-        local x, z = px + dir.X * length * i, pz + dir.Z * length * i
-        local floor = Workspace:Raycast(Vector3.new(x, floorY + 1.25, z), Vector3.new(0, -2.3, 0), params)
-        if not floor or floor.Normal.Y <= 0.6 then return nil end
-        local nextY, rise = floor.Position.Y, floor.Position.Y - floorY
-        if rise > 1.05 or rise < -0.85 then return nil end
-        if rise > 0.05 then raised = true end
-        local previous = Vector3.new(px + dir.X * length * (i - 1), floorY, pz + dir.Z * length * (i - 1))
-        local shapeOK, blocked = false, nil
-        if Workspace.Blockcast and length > 0.15 then
-            -- The column starts above the next tread, allowing a normal step
-            -- while still sweeping the whole body past thin rails/crossbars.
-            shapeOK, blocked = pcall(
-                function()
-                    return Workspace:Blockcast(
-                        CFrame.new(
-                            previous.X + dir.X * 0.075,
-                            math.max(floorY, nextY) + Follow.BodyH * 0.5 + 0.15,
-                            previous.Z + dir.Z * 0.075
-                        ),
-                        Vector3.new(0.1, Follow.BodyH, 0.1),
-                        dir * (length - 0.15),
-                        params
-                    )
-                end
-            )
-        end
-        if shapeOK then
-            if blocked then return nil end
-        else
-            for _, height in ipairs(STAIR_H) do
-                local hit = Workspace:Raycast(previous + Vector3.new(0, height, 0), dir * length, params)
-                if hit and hit.Normal.Y <= 0.6 then return nil end
-            end
-        end
-        if Workspace:Raycast(Vector3.new(x, nextY + 0.15, z), Vector3.new(0, Follow.BodyH, 0), params) then
-            return nil
-        end
-        floorY = nextY
-    end
-    if raised and floorY > baseY + 0.1 then return floorY end
-    return nil
-end
 function FH.Profile(px, pz, dir, baseY, reach, settings)
     local d = dir * reach
     local function cast(h)
@@ -3966,13 +3789,6 @@ function FH.Profile(px, pz, dir, baseY, reach, settings)
     if not first then return nil end
     local door = FH.DoorOf(first.Instance)
     if door then return "door", 0, first.Instance, door end
-    -- Rising treads meet higher rays farther ahead. A full-height wall meets
-    -- every ray at the same edge, so it needs no extra floor/body stair probes.
-    local stairCandidate = r1
-        and (not r2 or r2.Distance > r1.Distance + 0.1)
-        and (not r3 or not r2 or r3.Distance > r2.Distance + 0.1)
-    local stairFloor = stairCandidate and FH.StairLane(px, pz, dir, baseY, reach, settings)
-    if stairFloor then return "stairs", stairFloor - baseY, first.Instance, nil, stairFloor end
     local n = #SLOW_H
     local k = 0
     for i = r2 and 3 or 1, n do
@@ -4005,9 +3821,8 @@ end
 function FH.Seg(ax, az, dir, curY, seg, settings, ignoreBad)
     local bx, bz = ax + dir.X * seg, az + dir.Z * seg
     if not ignoreBad and FH.IsBad(bx, bz, 2.4) then return nil, "bad" end
-    local kind, sill, _, _, stairFloor = FH.Profile(ax, az, dir, curY, seg, settings)
+    local kind, sill = FH.Profile(ax, az, dir, curY, seg, settings)
     if kind == "door" or kind == "wall" then return nil, kind end
-    if kind == "stairs" then return stairFloor end
     local jumped = nil
     if kind then
         curY = curY + sill
@@ -6203,20 +6018,8 @@ function Follow.PlanClear(rp, point, feetY, reachLimit, settings, ignoreBad, bod
 end
 -- Keep a committed clear lane while the planner yields, rather than rerolling
 -- a new side-step every few frames. Waypoints replace it when the path is ready.
-function Follow.ActiveEscape(token, hum, root)
-    local recovery = FH.MoveWatch
-    return recovery ~= nil
-        and recovery.token == token
-        and recovery.root == root
-        and recovery.hum == hum
-        and recovery.escape ~= nil
-        and os.clock() < (recovery.escapeUntil or 0)
-end
 function Follow.PlanStep(token, hum, root, goal, feetY, state, rescueGoal)
     if not TokOK(token) or Ctl.On() or Fly.Active then return false end
-    -- The shared motion controller validates the committed side lane. Probing
-    -- the old waypoint here would jump into or reject the original obstacle.
-    if Follow.ActiveEscape(token, hum, root) then return FH.Move(token, hum, goal) end
     local rp, now = root.Position, os.clock()
     local stable = type(token) == "number" and not rescueGoal
     local function clearLane(from, point, y, reach)
@@ -6266,7 +6069,7 @@ function Follow.PlanStep(token, hum, root, goal, feetY, state, rescueGoal)
         if #state.trail > 16 then table.remove(state.trail, 1) end
     end
     local aim = state.aim
-    if not state.progressPos or Flat(rp - state.progressPos).Magnitude >= 0.8 then
+    if not state.progressPos or (rp - state.progressPos).Magnitude >= 0.8 then
         state.progressPos, state.progressAt = rp, now
     end
     local flight = stable and FH.JumpFlight
@@ -6904,20 +6707,11 @@ function Follow.WalkTo(token, getGoal, stopDist, abort, opts)
         end
         clearPath()
         if FH.Motion.replanToken == token then FH.Motion.replanToken = nil end
-        local recovery = FH.MoveWatch
-        if recovery and recovery.token == token then
-            -- A completed plan must not pull us back into the obstruction while
-            -- the owning controller is still crossing its verified side lane.
-            local keepEscape = recovery.root == root
-                and recovery.hum == hum
-                and recovery.escape ~= nil
-                and os.clock() < (recovery.escapeUntil or 0)
-            if not keepEscape then
-                if stableFollow then
-                    recovery.escape, recovery.escapeUntil = nil, nil
-                else
-                    FH.MoveWatch = nil
-                end
+        if FH.MoveWatch and FH.MoveWatch.token == token then
+            if stableFollow then
+                FH.MoveWatch.escape, FH.MoveWatch.escapeUntil = nil, nil
+            else
+                FH.MoveWatch = nil
             end
         end
         mode, wps, wpi, wpFull = "path", w, index, full
@@ -7253,11 +7047,6 @@ function Follow.WalkTo(token, getGoal, stopDist, abort, opts)
             if not (keep and flatDist > 5 and keep()) then return finish("arrived", true) end
         end
         if job and not job.done and now - job.at > 8 then return finish("timeout", true) end
-        if Follow.ActiveEscape(token, hum, root) then
-            FH.Move(token, hum, goal)
-            task.wait(0.03)
-            continue
-        end
         if job and job.done then
             local j = job
             job = nil
@@ -8035,20 +7824,13 @@ function Follow.Chase(token, getGoal, stopDist, abort, keep)
         FH.Tick(hum, root)
         local jump = (stable and FH.JumpFlight) or FH.Jmp
         local jumping = hum.FloorMaterial == Enum.Material.Air and jump and jump.hum == hum and jump.root == root
-        local escaping = Follow.ActiveEscape(token, hum, root)
-        if FH.Motion.replanToken == token and not escaping then return finish("trapped", false) end
+        if FH.Motion.replanToken == token then return finish("trapped", false) end
         if
             flatDist <= sd
             and dyg < Follow.MaxDY
             and (sd <= 3.5 or flatDist <= 2.5 or sd >= 20 or FH.Sight(rp, goal))
         then
             if not (keep and flatDist > 5 and keep()) then return finish("arrived", true) end
-        end
-
-        if escaping then
-            FH.Move(token, hum, goal)
-            task.wait(0.03)
-            continue
         end
 
         if FH.ForceUnstick then
@@ -8137,7 +7919,7 @@ function Follow.Chase(token, getGoal, stopDist, abort, keep)
             FH.Move(token, hum, aimNow)
         end
         -- kẹt cứng
-        if not lastPos or Flat(rp - lastPos).Magnitude >= 0.8 then
+        if not lastPos or (rp - lastPos).Magnitude >= 0.8 then
             lastPos, lastChk, stuckN = rp, now, 0
         elseif now - lastChk >= 1.2 then
             lastChk = now
@@ -8167,269 +7949,6 @@ function Follow.Chase(token, getGoal, stopDist, abort, keep)
     return finish("abort", false)
 end
 
--- Exit readiness and waiting share one movement owner; opening does not imply escaping.
-function FH.ExitDoorOpen(door, center, triggers)
-    if not door or not IsInWorld(door) then return false end
-    center = center or FH.ExitArea(door)
-    triggers = triggers or (door:IsA("Model") and FH.Triggers(door) or {})
-    if not center or #triggers == 0 then return false end
-    FH.ExitDoorParams = FH.ExitDoorParams or setmetatable({}, { __mode = "k" })
-    local params = FH.ExitDoorParams[door]
-    if not params then
-        params = RaycastParams.new()
-        params.FilterType = Enum.RaycastFilterType.Include
-        params.FilterDescendantsInstances = { door }
-        pcall(function() params.RespectCanCollide = true end)
-        FH.ExitDoorParams[door] = params
-    end
-    for _, trigger in ipairs(triggers) do
-        if trigger.Parent then
-            local delta = Flat(center - trigger.Position)
-            if delta.Magnitude >= 1 then
-                local clear = true
-                for _, height in ipairs({ 0.5, 2.5 }) do
-                    local from = trigger.Position + Vector3.new(0, height, 0)
-                    local hit = Workspace:Raycast(from, delta + delta.Unit * 2, params)
-                    if hit and hit.Instance.CanCollide and hit.Normal.Y < 0.6 then
-                        clear = false
-                        break
-                    end
-                end
-                if clear then return true end
-            end
-        end
-    end
-    return false
-end
-function FH.AnyExitOpen()
-    local map = GetCurrentMap()
-    if not map then return false end
-    local cached, now = FH.ExitPhysicalCache, os.clock()
-    if cached and cached.map == map and now - cached.at < 0.25 then return cached.open end
-    local open = false
-    for _, door in ipairs(ExitDoors) do
-        if IsInWorld(door) and door:IsDescendantOf(map) and FH.ExitDoorOpen(door) then
-            open = true
-            break
-        end
-    end
-    FH.ExitPhysicalCache = { map = map, at = now, open = open }
-    return open
-end
-function FH.ExitPriority()
-    if not FH.ExitOpen() then return false end
-    if not AH.Eval().danger then return true end
-    return os.clock() >= (AH.ExitRetryAt or 0) and FH.AnyExitOpen()
-end
-function FH.ActiveSurvivor(player)
-    if player.Parent ~= Players or FH.True(player, FH.BEASTN) or FH.True(player, FH.ESC) then return false end
-    local hp = FH.Stat(player, FH.HP)
-    if not hp or type(hp.Value) ~= "number" or hp.Value <= 0 then return false end
-    local character = player.Character
-    local hum = character and character:FindFirstChildOfClass("Humanoid")
-    return hum ~= nil and hum.Health > 0 and FH.InMatchPlayer(player)
-end
-function FH.ExitDanger()
-    local e = AH.Eval()
-    return e.danger == true or (e.pos ~= nil and e.dist <= AH.NearRange)
-end
-function FH.ExitPolicy(center, stand)
-    local active, ready = 0, true
-    for _, player in ipairs(Players:GetPlayers()) do
-        if FH.ActiveSurvivor(player) then
-            active = active + 1
-            if player ~= LocalPlayer then
-                local root = player.Character and player.Character:FindFirstChild("HumanoidRootPart")
-                if
-                    not root
-                    or FH.True(player, FH.CAP)
-                    or FH.True(player, FH.RAG)
-                    or not center
-                    or Flat(root.Position - center).Magnitude > Follow.ExitTeamRange
-                    or math.abs(root.Position.Y - center.Y) > Follow.MaxDY + 1.5
-                    or not FH.ApproachClear(root.Position, stand or center)
-                then
-                    ready = false
-                end
-            end
-        end
-    end
-    -- One remaining teammate (or none) never requires waiting.
-    return active <= 2 or ready, active
-end
-function FH.ExitRoute(token, state, abort)
-    local function escaped() return FH.True(LocalPlayer, FH.ESC) end
-    local function stopped()
-        if type(token) == "table" and token.owner == "evade" then
-            AH.SetState(AH.Eval().danger and "flee" or "idle")
-            if AH.Eval().danger and not FH.AnyExitOpen() then return true end
-        end
-        if AH.Eval().danger and state.opening and not FH.ExitDoorOpen(state.door, state.center, state.triggers) then
-            return true
-        end
-        return not TokOK(token)
-            or Ctl.On()
-            or Fly.Active
-            or FH.Prio()
-            or not FH.MotionAvailable(token)
-            or AH.Down()
-            or FH.AmBeast()
-            or escaped()
-            or (abort ~= nil and abort())
-    end
-    if stopped() then return escaped() and "escaped" or nil end
-    local root, hum, map = RootNow(), GetHumanoid(), GetCurrentMap()
-    if not (root and hum and map) then return nil end
-    if state.map ~= map or state.character ~= LocalPlayer.Character then
-        table.clear(state)
-        state.map, state.character, state.fail, state.loiter = map, LocalPlayer.Character, {}, {}
-    end
-    local now = os.clock()
-    if AH.Eval().danger and state.door and not FH.ExitDoorOpen(state.door, state.center, state.triggers) then
-        state.door = nil
-    end
-    if not state.door or not IsInWorld(state.door) or state.repickAt and now >= state.repickAt then
-        local best, score, chosenCenter, chosenTriggers, chosenSize, chosenArea
-        for _, door in ipairs(ExitDoors) do
-            if IsInWorld(door) and door:IsDescendantOf(map) and not (state.fail[door] and state.fail[door] > now) then
-                local center, size, area = FH.ExitArea(door)
-                if center then
-                    local triggers = door:IsA("Model") and FH.Triggers(door) or {}
-                    local open = FH.ExitDoorOpen(door, center, triggers)
-                    local distance = (center - root.Position).Magnitude
-                    local rank = distance + (open and 0 or 10000)
-                    if (not AH.Eval().danger or open) and (not score or rank < score) then
-                        best, score, chosenCenter, chosenTriggers, chosenSize, chosenArea =
-                            door, rank, center, triggers, size, area
-                    end
-                end
-            end
-        end
-        state.door, state.center, state.triggers = best, chosenCenter, chosenTriggers
-        state.areaSize, state.area = chosenSize, chosenArea
-        state.stand, state.waitPos, state.loiter = nil, nil, {}
-        state.repickAt = now + 3
-        if best and FH.ExitDoorOpen(best, chosenCenter, chosenTriggers) then state.repickAt = nil end
-        if not best then return AH.Eval().danger and "evade" or "retry" end
-    end
-    local door, center = state.door, state.center
-    if not center then return "retry" end
-    if not state.stand then
-        local nearest
-        for _, trigger in ipairs(state.triggers) do
-            local distance = (trigger.Position - root.Position).Magnitude
-            if trigger.Parent and (not nearest or distance < nearest) then
-                state.stand, nearest = trigger, distance
-            end
-        end
-    end
-    local outward = state.stand and Flat(state.stand.Position - center) or Flat(root.Position - center)
-    if outward.Magnitude < 0.5 then outward = Flat(root.Position - center) end
-    if outward.Magnitude < 0.5 then outward = Vector3.new(0, 0, 1) end
-    outward = outward.Unit
-    -- Wait on the room side instead of drifting through the escape volume.
-    local waitRange = 9
-    if state.areaSize then
-        local direction = state.area and state.area.CFrame:VectorToObjectSpace(outward) or outward
-        waitRange = math.max(
-            waitRange,
-            math.abs(direction.X) * state.areaSize.X * 0.5 + math.abs(direction.Z) * state.areaSize.Z * 0.5 + 3.5
-        )
-    end
-    state.waitPos = state.waitPos
-        or FH.Ground(
-            center
-                + outward
-                    * math.max(waitRange, state.stand and Flat(state.stand.Position - center).Magnitude or waitRange)
-        )
-    local open = FH.ExitDoorOpen(door, center, state.triggers)
-    local goal = not open and state.stand and state.stand.Position or state.waitPos
-    if Flat(goal - root.Position).Magnitude > 3.5 or math.abs(goal.Y - root.Position.Y) > Follow.MaxDY then
-        local result = Follow.WalkTo(
-            token,
-            function() return goal end,
-            1.8,
-            stopped,
-            { maxTime = 8, nearOk = 3, windows = true }
-        )
-        if stopped() then return escaped() and "escaped" or nil end
-        root, hum = RootNow(), GetHumanoid()
-        if not (root and hum) then return nil end
-        if
-            result ~= "arrived"
-            and (Flat(goal - root.Position).Magnitude > 4 or math.abs(goal.Y - root.Position.Y) > Follow.MaxDY)
-        then
-            state.fail[door], state.door = os.clock() + 3, nil
-            return "retry"
-        end
-    end
-    if not open and state.stand then
-        local started, hold = os.clock(), { on = false }
-        state.opening = true
-        while not stopped() and os.clock() - started < 12 do
-            root, hum = RootNow(), GetHumanoid()
-            if not (root and hum and state.stand.Parent) then break end
-            local delta = state.stand.Position - root.Position
-            local distance = math.abs(delta.Y) <= 3.6 and Flat(delta).Magnitude or math.huge
-            Follow.Beat = os.clock()
-            if FH.CanHold(hold, distance, 1.7, 3.6) then
-                FH.Move(token, hum, root.Position)
-                Follow.Hold(state.stand:FindFirstChild("Event"), false, true, false, token)
-                FH.MarkWork(token, "exit")
-            else
-                Follow.Release(token)
-                FH.Move(token, hum, state.stand.Position)
-            end
-            task.wait(0.04)
-            if FH.ExitDoorOpen(door, center, state.triggers) then break end
-        end
-        Follow.Release(token)
-        state.opening = nil
-        if AH.Eval().danger and not FH.ExitDoorOpen(door, center, state.triggers) then
-            state.door = nil
-            return "evade"
-        end
-        if stopped() then return escaped() and "escaped" or nil end
-        open = FH.ExitDoorOpen(door, center, state.triggers)
-    end
-    if not open then
-        state.fail[door], state.door = os.clock() + 3, nil
-        return "retry"
-    end
-    state.repickAt = nil
-    local ready = FH.ExitPolicy(center, state.waitPos)
-    if ready or FH.ExitDanger() then
-        local through = FH.Ground(center - outward * 10)
-        Follow.WalkTo(
-            token,
-            function() return through end,
-            1.5,
-            stopped,
-            { maxTime = 8, nearOk = 2.5, noDoor = true, windows = true }
-        )
-        if escaped() then return "escaped" end
-        if stopped() then return nil end
-        Follow.Push(token, through, 1, stopped, 1.5)
-        return escaped() and "escaped" or "retry"
-    end
-    root, hum = RootNow(), GetHumanoid()
-    if root and hum then
-        if Flat(root.Position - state.waitPos).Magnitude > 4 then
-            Follow.WalkTo(
-                token,
-                function() return state.waitPos end,
-                2,
-                function() return stopped() or FH.ExitDanger() or FH.ExitPolicy(center, state.waitPos) end,
-                { maxTime = 3, nearOk = 3 }
-            )
-        else
-            FH.ExitLoiter(token, state.waitPos, center, state.loiter)
-        end
-    end
-    task.wait(0.06)
-    return "waiting"
-end
-
 function Follow.Main(token, player)
     local function alive()
         return not unloaded
@@ -8449,7 +7968,7 @@ function Follow.Main(token, player)
     local anchor, stillSince = nil, os.clock()
     local spaceAnchor, spaceSince = nil, os.clock()
     local lookAnchor = nil
-    local hackSkip, podSkip = {}, {}
+    local hackSkip, podSkip, ExitFail = {}, {}, {}
     local doneComputers = setmetatable({}, { __mode = "k" })
     local timedOut = setmetatable({}, { __mode = "k" })
     local exitTryAt = 0
@@ -8460,7 +7979,8 @@ function Follow.Main(token, player)
     local afkSent = false
     local wasBusy = false
     local fwPos, fwAt = nil, os.clock()
-    local exitState = {}
+    local exitOpened, exitWaitSince, exitSkip, exitStandPos = false, nil, 0, nil
+    local exitWaitCenter, exitLoiter = nil, {}
     local function setLabel(t)
         if label ~= t then
             label = t
@@ -8858,27 +8378,203 @@ function Follow.Main(token, player)
         if res == "far" then podSkip[info.trig] = os.clock() + 15 end
     end
 
-    local function exitRun(extraAbort)
-        local result = FH.ExitRoute(
-            token,
-            exitState,
-            function() return not go() or meBad() or meOut() or (extraAbort ~= nil and extraAbort()) end
-        )
-        if result == "escaped" then return true end
-        if result == "retry" then return false end
-        return result
+    local function exitRun(extraAbort, openOnly)
+        local mr = myRoot()
+        if not mr then
+            task.wait(0.3)
+            return nil
+        end
+        local now = os.clock()
+        local best, bs
+        for _, d in ipairs(ExitDoors) do
+            if IsInWorld(d) and not (ExitFail[d] and ExitFail[d] > now) then
+                local okp, pv = pcall(function() return d:GetPivot().Position end)
+                if okp then
+                    local s = (pv - mr.Position).Magnitude
+                    if not bs or s < bs then
+                        best, bs = d, s
+                    end
+                end
+            end
+        end
+        if not best then
+            task.wait(0.4)
+            return nil
+        end
+        local function ab() return not go() or meBad() or meOut() or (extraAbort ~= nil and extraAbort()) end
+        local center = FH.ExitArea(best)
+        if not center then
+            ExitFail[best] = os.clock() + 10
+            return false
+        end
+        local cg = FH.Ground(center)
+        local trigs = best:IsA("Model") and FH.Triggers(best) or {}
+        local function blocked()
+            local r = myRoot()
+            if not r then return false end
+            FH.RefreshFilter()
+            for _, h in ipairs({ -1, 1 }) do
+                local o = r.Position + Vector3.new(0, h, 0)
+                local tgt = Vector3.new(center.X, o.Y, center.Z)
+                local hit = Workspace:Raycast(o, tgt - o, rayParams)
+                if hit and hit.Instance:IsDescendantOf(best) then return true end
+            end
+            return false
+        end
+        for attempt = 1, 3 do
+            if ab() then return nil end
+            local r0 = myRoot()
+            if not r0 then return nil end
+            local stand
+            if #trigs > 0 then
+                table.sort(
+                    trigs,
+                    function(a, b) return (a.Position - r0.Position).Magnitude < (b.Position - r0.Position).Magnitude end
+                )
+                stand = trigs[1]
+            end
+            local standPos
+            if stand then
+                standPos = stand.Position
+            else
+                local dv0 = Flat(r0.Position - cg)
+                if dv0.Magnitude < 0.5 then dv0 = Vector3.new(0, 0, 1) end
+                standPos = FH.Ground(cg + dv0.Unit * 6)
+            end
+            exitStandPos, exitWaitCenter = standPos, cg
+            Follow.WalkTo(token, function() return standPos end, 1.4, ab, { maxTime = 60, nearOk = 3.5 })
+            if ab() then return nil end
+            if stand and blocked() then
+                local ev = stand:FindFirstChild("Event")
+                local st = { on = false }
+                local t0 = os.clock()
+                while not ab() and os.clock() - t0 < 12 do
+                    Follow.Beat = os.clock()
+                    if Ctl.Gate() then
+                        st.on, st.since = false, nil
+                    end
+                    local hum = GetHumanoid()
+                    local r = RootNow()
+                    if hum and r then
+                        local offset = stand.Position - r.Position
+                        local dist = math.abs(offset.Y) <= 3.6 and Flat(offset).Magnitude or math.huge
+                        if FH.CanHold(st, dist, 1.7, 3.6) then
+                            FH.Move(token, hum, r.Position)
+                            Follow.Hold(ev, false, true)
+                            FH.MarkWork(token, "exit")
+                            fwPos, fwAt = r.Position, os.clock()
+                        else
+                            Follow.Release(token)
+                            FH.Move(token, hum, stand.Position)
+                        end
+                    end
+                    task.wait(0.04)
+                    if not blocked() then break end
+                end
+                Follow.Release()
+                if ab() then return nil end
+                task.wait(0.05)
+            end
+
+            if openOnly then
+                if not blocked() then return "opened" end
+            else
+                local rs = myRoot()
+                local sp = rs and rs.Position or cg
+                local dv = Flat(cg - sp)
+                local dirv = dv.Magnitude > 0.5 and dv.Unit or Vector3.new(0, 0, 1)
+                if dv.Magnitude > 8 then
+                    Follow.WalkTo(
+                        token,
+                        function() return cg end,
+                        1.2,
+                        ab,
+                        { maxTime = 10, nearOk = 2.5, noDoor = true }
+                    )
+                    if ab() then return meOut() and true or nil end
+                end
+                Follow.Push(token, cg + dirv * 10, 4, ab, 1.5)
+                if meOut() then return true end
+            end
+        end
+
+        ExitFail[best] = os.clock() + 10
+        return false
     end
-    local function onExitResult(result)
-        if result == true then FH.ExitFails = 0 end
-        if result == false then FH.ExitFails = FH.ExitFails + 1 end
+
+    local function onExitResult(r, keepExits)
+        if r == true then
+            FH.ExitFails = 0
+        elseif r == false then
+            FH.ExitFails = FH.ExitFails + 1
+            local E = FH.Endgame
+            if E.on and E.soft and not keepExits then
+                FH.Endgame = { on = false }
+                FH.SoftBan = os.clock() + 60
+                FH.ChangedN = 0
+                exitTryAt = os.clock() + 30
+            end
+        end
     end
-    local function exitStage()
-        setLabel("Follow [0]: EXIT")
-        Follow.Release(token)
-        local result = exitRun()
-        onExitResult(result)
-        if result == "waiting" then setLabel("Follow [0]: EXIT-WAIT") end
-        task.wait(result == false and 0.12 or 0.03)
+
+    local function exitStage(ignore, farm)
+        if os.clock() < exitSkip then return false end
+        local function captured() return #capturedPods() > 0 end
+        local function ab2()
+            if amBeast() then return true end
+            if farm then return captured() end
+            return targetCaptured() or targetState() ~= "ok"
+        end
+        if not exitOpened then
+            setLabel("Follow [0]: EXIT")
+            local r = exitRun(ab2, true)
+            if r == "opened" then
+                exitOpened, exitWaitSince = true, os.clock()
+            elseif r == false then
+                onExitResult(false)
+                exitSkip = os.clock() + 12
+                return false
+            end
+            return true
+        end
+        setLabel("Follow [0]: EXIT-WAIT")
+        local pod = nearestPod(nil)
+        if pod then
+            local sf = nil
+            if not farm then sf = function() return targetState() ~= "ok" end end
+            rescuePod(pod, sf)
+            return true
+        end
+        if not FH.OthersRemain(ignore) and (farm or not targetCaptured()) then
+            local r = exitRun(farm and captured or function() return targetCaptured() end)
+            onExitResult(r)
+            return true
+        end
+        if exitWaitSince and os.clock() - exitWaitSince > Follow.ExitWait then
+            if farm then
+                local r = exitRun(captured)
+                onExitResult(r)
+                return true
+            end
+            exitSkip = os.clock() + 40
+            exitWaitSince, exitOpened = nil, false
+            return false
+        end
+        local mr, hum = myRoot(), GetHumanoid()
+        if mr and hum then
+            if exitStandPos and Flat(exitStandPos - mr.Position).Magnitude > 6 then
+                Follow.WalkTo(
+                    token,
+                    function() return exitStandPos end,
+                    3,
+                    function() return not go() or meBad() or captured() or (not farm and targetCaptured()) end,
+                    { maxTime = 20, nearOk = 4 }
+                )
+            else
+                FH.ExitLoiter(token, exitStandPos, exitWaitCenter, exitLoiter)
+                task.wait(0.08)
+            end
+        end
         return true
     end
     -- Có máy ĐÃ hack xong trong bán kính `radius` quanh `pos` không?
@@ -8970,12 +8666,16 @@ function Follow.Main(token, player)
         local function hasCaptured() return #capturedPods() > 0 end
         local function targetBack() return afk and targetActive() end
         if targetBack() then return end
-        -- Opening exits takes priority; teammates wait at the approach side.
+        -- Farm exits as soon as exits unlock; failed routes never fall through to hacking.
         if FH.ExitOpen() then
-            exitStage()
+            setLabel("Follow [0]: EXIT")
+            Follow.Release(token)
+            local result = exitRun(targetBack)
+            onExitResult(result, true)
+            task.wait(0.15)
             return
         end
-        table.clear(exitState)
+        exitOpened, exitWaitSince = false, nil
         local pod = nearestPod(nil)
         if pod then
             rescuePod(pod, targetBack)
@@ -9036,13 +8736,11 @@ function Follow.Main(token, player)
         local tp = tr.Position
         local still = stillFor(tp)
         local endg = FH.ExitOpen()
-        if not endg then table.clear(exitState) end
+        if not endg then
+            exitOpened, exitWaitSince = false, nil
+        end
         local range, moving = Follow.TargetRange(tr, spacingStill(tp))
         local danger = (not beast) and targetDanger()
-        if not beast and endg and matchOn() and not meOut() then
-            exitStage()
-            return
-        end
         if not beast then
             if targetCaptured() then
                 local info = nearestPod(player) or nearestPod(nil)
@@ -9051,6 +8749,9 @@ function Follow.Main(token, player)
                     return
                 end
             end
+        end
+        if not beast and endg and matchOn() and not meOut() then
+            if exitStage(player, false) then return end
         end
         if not beast and not danger and still >= Follow.AfkFarmTime and matchOn() then
             farmStep(true)
@@ -9148,6 +8849,11 @@ function Follow.Main(token, player)
                 followFails = followFails + 1
                 task.wait(0.2)
             end
+            if followFails >= 3 and not beast and not danger and FH.ExitOpen() and not FH.OthersRemain() then
+                followFails = 0
+                local r = exitRun(function() return targetCaptured() end)
+                onExitResult(r)
+            end
         else
             followFails = 0
             task.wait(0.03)
@@ -9227,10 +8933,8 @@ function AH.ReleaseTap()
     if not AH.TapDown then return end
     local backend = AH.TapBackend or "vim"
     AH.TapDown, AH.TapUntil = false, 0
-    AH.TapBackend, AH.TapCharacter = nil, nil
+    AH.TapBackend = nil
     AH.TapSerial = (AH.TapSerial or 0) + 1
-    -- A later interaction or a real E hold owns its release. Never lift their key.
-    if Follow.KeyDown or AR.KeyDown or TR.KeyDown or Ctl.Down[Enum.KeyCode.E] then return end
     Ctl.EUntil = os.clock() + 0.3
     local released = false
     if backend == "keys" and type(keyrelease) == "function" then
@@ -9247,7 +8951,7 @@ end
 function AH.RedAlert() return AH.Active and not FH.AmBeast() and AH.State ~= "idle" end
 function AH.TapStep()
     local now = os.clock()
-    if AH.TapDown and (now >= AH.TapUntil or AH.TapCharacter ~= LocalPlayer.Character) then AH.ReleaseTap() end
+    if AH.TapDown and now >= AH.TapUntil then AH.ReleaseTap() end
     local red = AH.RedAlert()
     if not red then
         AH.ReleaseTap()
@@ -9263,45 +8967,31 @@ function AH.TapStep()
         or FH.AmBeast()
         or AH.Down()
         or Fly.Active
-        or Ctl.Down[Enum.KeyCode.E]
+        or Ctl.On()
+        or FH.Prio()
         or UserInputService:GetFocusedTextBox()
     then
         AH.ReleaseTap()
         return
     end
-    if
-        Follow.Held
-        or Follow.KeyDown
-        or AR.Held
-        or AR.KeyDown
-        or TR.Held
-        or TR.KeyDown
-        or remoteHackEvent ~= nil
-        or FH.IsHacking(FH.Motion and FH.Motion.token)
-    then
+    if Follow.Held or Follow.KeyDown or AR.Held or AR.KeyDown or TR.Held or TR.KeyDown or remoteHackEvent ~= nil then
         AH.ReleaseTap()
         return
     end
     if not AH.TapDown and now >= AH.NextTapAt then
-        -- Walking or a movement command is not an E owner. Only a physical E
-        -- hold, text input or a live interaction pauses these independent taps.
-        if UserInputService:IsKeyDown(Enum.KeyCode.E) then return end
         Ctl.EUntil = now + 0.3
         local ok, backend = false, nil
-        -- Executor keyboard injection follows the same path as a normal key;
-        -- some environments expose VIM but silently ignore its synthetic press.
-        if type(keypress) == "function" and type(keyrelease) == "function" then
-            ok = pcall(keypress, 0x45)
-            if ok then backend = "keys" end
-        end
-        if not ok and VIM then
+        if VIM then
             ok = pcall(function() VIM:SendKeyEvent(true, Enum.KeyCode.E, false, game) end)
             if ok then backend = "vim" end
         end
-        AH.NextTapAt = now + (ok and 2 or 0.25)
+        if not ok and type(keypress) == "function" and type(keyrelease) == "function" then
+            ok = pcall(keypress, 0x45)
+            if ok then backend = "keys" end
+        end
+        AH.NextTapAt = now + 2
         if ok then
             AH.TapDown, AH.TapUntil, AH.TapBackend = true, now + 0.06, backend
-            AH.TapCharacter = LocalPlayer.Character
         end
     end
 end
@@ -9310,10 +9000,6 @@ TrackConnection(RunService.Heartbeat:Connect(function()
     if not AH.Active and not AH.TapDown and not AH.TapRed then return end
     local ok = pcall(AH.TapStep)
     if not ok then AH.ReleaseTap() end
-end))
-TrackConnection(LocalPlayer.CharacterRemoving:Connect(function()
-    AH.ReleaseTap()
-    AH.TapRed, AH.NextTapAt = false, 0
 end))
 
 function AH.SetLabel()
@@ -9725,7 +9411,7 @@ function AH.Go(tok)
     local jukeState, wasJuking = {}, false
     AH.Dir = nil
     while TokOK(tok) do
-        if Ctl.On() or FH.Prio() or not FH.MotionAvailable(tok) or FH.ExitPriority() then break end
+        if Ctl.On() or FH.Prio() or not FH.MotionAvailable(tok) then break end
         local hum, root = GetHumanoid(), RootNow()
         if not (hum and root) or hum.Health <= 0 or AH.Down() or Fly.Active then break end
         if FH.AmBeast() then break end
@@ -9805,25 +9491,6 @@ function AH.Go(tok)
     FH.ReleaseMotion(tok, not Ctl.On())
 end
 
-function AH.ExitGo(tok)
-    AH.ExitState = AH.ExitState or {}
-    local outcome
-    while TokOK(tok) and FH.ExitPriority() and not FH.True(LocalPlayer, FH.ESC) do
-        if Ctl.On() or Fly.Active or FH.Prio() or AH.Down() or not FH.MotionAvailable(tok) then break end
-        local danger = AH.Eval().danger
-        AH.SetState(danger and "flee" or "idle")
-        local result = FH.ExitRoute(tok, AH.ExitState, function() return not FH.ExitOpen() end)
-        if AH.Eval().danger and (result == "evade" or result == "retry") then
-            AH.ExitRetryAt, outcome = os.clock() + 0.7, "evade"
-            break
-        end
-        if result == nil or result == "escaped" then break end
-        task.wait(result == "retry" and 0.1 or 0.02)
-    end
-    Follow.Release(tok)
-    FH.ReleaseMotion(tok, not Ctl.On())
-    return outcome
-end
 function AH.Step(tok)
     local hum, root = GetHumanoid(), RootNow()
     if not FH.MotionAvailable(tok) then
@@ -9847,24 +9514,12 @@ function AH.Step(tok)
         or Fly.Active
         or not FH.MatchOn()
         or FH.True(LocalPlayer, FH.BEASTN)
-        or not FH.ActiveSurvivor(LocalPlayer)
         or AH.Down()
     then
         AH.Last = { danger = false, dist = math.huge }
         AH.SetState("idle")
         AH.BusyFlag = false
         task.wait(0.2)
-        return
-    end
-    if FH.ExitPriority() and not FH.True(LocalPlayer, FH.ESC) then
-        AH.BusyFlag = true
-        local result = AH.ExitGo(tok)
-        if result == "evade" and TokOK(tok) and AH.Eval().danger then
-            AH.SetState("flee")
-            AH.Go(tok)
-        end
-        AH.BusyFlag = false
-        AH.SetState("idle")
         return
     end
     if AH.PodsPending() then
@@ -9894,8 +9549,6 @@ function AH.Loop(token)
         local ok, err = pcall(AH.Step, tok)
         if not ok then
             warn("[AutoHide] loi: " .. tostring(err))
-            pcall(Follow.Release, tok)
-            FH.ReleaseMotion(tok, not Ctl.On())
             AH.SetState("idle")
             AH.BusyFlag = false
             task.wait(0.5)
@@ -17343,7 +16996,7 @@ TrackConnection(LocalPlayer.CharacterRemoving:Connect(CB.BeastClear))
 -- ================= END BEAST CLICK ANIMATIONS =================
 
 -- ================= EMOTE [6] / SPECTATE [7] =================
-EX.Group, EX.List = 1, {}
+EX.Group, EX.Page, EX.List = 1, 1, {}
 EX.SelfColor = Color3.fromRGB(180, 85, 15)
 function EX.SubjectFor(player)
     local character = player and player.Character
@@ -17412,6 +17065,7 @@ function EX.RebuildPlayers(skip)
     end
     table.sort(list, function(a, b) return a.UserId < b.UserId end)
     EX.List = list
+    EX.Page = math.clamp(EX.Page, 1, math.max(1, math.ceil(#list / 4)))
     if EX.Mode ~= "spectate" or not EX.Target then return end
     local subject = EX.SubjectFor(EX.Target)
     local valid = EX.Target ~= skip and subject ~= nil and subject == EX.TargetSubject
@@ -17439,7 +17093,7 @@ function EX.Refresh()
     EX.Extra.Visible = EX.Mode == "spectate"
     if EX.Mode == "emote" then
         local group = EM.Groups[EX.Group]
-        EX.Section.Text = group.Name .. " [" .. EX.Group .. "/4]  Q >"
+        EX.Section.Text = group.Name .. " [" .. EX.Group .. "/4]  R >"
         for i, row in ipairs(EX.Rows) do
             local data = group[i]
             row.Visible = true
@@ -17449,10 +17103,11 @@ function EX.Refresh()
         EX.Extra.Text = ""
         EX.Footer.Text = EM.LastError or "Same key: stop emote"
     else
-        EX.Section.Text = "Players [1-4]"
+        local pages = math.max(1, math.ceil(#EX.List / 4))
+        EX.Section.Text = "Players [" .. EX.Page .. "/" .. pages .. "]  R >"
         for i, row in ipairs(EX.Rows) do
             row.Visible = i <= 4
-            local player = i <= 4 and EX.List[i] or nil
+            local player = i <= 4 and EX.List[(EX.Page - 1) * 4 + i] or nil
             local name = player and (player.DisplayName ~= "" and player.DisplayName or player.Name)
             row.Text = player and i .. ". " .. name or (i == 1 and #EX.List == 0 and "No players available" or "")
             row.TextColor3 = player and player == EX.Target and GREEN
@@ -17460,7 +17115,7 @@ function EX.Refresh()
                 or Theme.SubText
         end
         EX.Extra.Text = "Return to my camera"
-        EX.Footer.Text = "1-4: watch/stop | 7: close"
+        EX.Footer.Text = "1-4: watch player | 7: close"
     end
 end
 function EX.Select(index)
@@ -17468,10 +17123,9 @@ function EX.Select(index)
         EM.Toggle(EX.Group, index)
     elseif EX.Mode == "spectate" then
         if index < 1 or index > 4 then return false end
-        local player = EX.List[index]
+        local player = EX.List[(EX.Page - 1) * 4 + index]
         local subject = EX.SubjectFor(player)
         if subject then
-            if EX.Target == player and EX.TargetSubject == subject then return EX.ReturnCamera() end
             EX.Target, EX.TargetSubject = player, subject
             EX.ApplyCamera()
         end
@@ -17479,10 +17133,12 @@ function EX.Select(index)
     EX.Refresh()
 end
 function EX.CycleSection()
-    if EX.Mode ~= "emote" then return false end
-    EX.Group = EX.Group % #EM.Groups + 1
+    if EX.Mode == "emote" then
+        EX.Group = EX.Group % #EM.Groups + 1
+    elseif EX.Mode == "spectate" then
+        EX.Page = EX.Page % math.max(1, math.ceil(#EX.List / 4)) + 1
+    end
     EX.Refresh()
-    return true
 end
 function EX.SetMode(mode)
     if EX.Mode == "spectate" and mode ~= "spectate" then EX.StopSpectate() end
@@ -17510,13 +17166,6 @@ function EX.ReturnCamera()
     if EX.Mode ~= "spectate" then return false end
     EX.RestoreCamera()
     EX.Target, EX.TargetSubject = nil, nil
-    local camera, hum = Workspace.CurrentCamera, GetHumanoid()
-    if camera and hum and hum.Parent and hum.Health > 0 then
-        if camera.CameraSubject ~= hum or camera.CameraType == Enum.CameraType.Scriptable then
-            camera.CameraSubject = hum
-            camera.CameraType = Enum.CameraType.Custom
-        end
-    end
     EX.Refresh()
     return true
 end
@@ -17873,11 +17522,11 @@ TrackConnection(UserInputService.InputBegan:Connect(function(input, gameProcesse
         EX.ToggleEmote()
         return
     end
-    if EX.Mode == "emote" and keyCode == Enum.KeyCode.Q then
-        EX.CycleSection()
-        return
-    end
     if EX.Mode ~= "closed" and ScreenGui.Enabled then
+        if keyCode == Enum.KeyCode.R then
+            EX.CycleSection()
+            return
+        end
         local pick = NUM_KEYS[keyCode]
         if EX.Mode == "emote" and pick and pick <= 5 then
             EX.Select(pick)
