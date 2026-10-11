@@ -18772,7 +18772,7 @@ function EM.PlayCombo(data)
     end)
     return true
 end
-EM.CircleRadius, EM.CircleSpeed = 6, 48
+EM.CircleRadius, EM.CircleSpeed = 5, 17
 function EM.CircleTarget()
     local root, best, bestRoot, bestHum, bestDistance = RootNow(), nil, nil, nil, math.huge
     if not root then return nil end
