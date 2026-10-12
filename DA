@@ -2511,13 +2511,21 @@ local PATH_SPECS = { { 2.4, 5 }, { 1.2, 4 } }
 -- Manual input / flight always wins. Expiring leases cannot strand a stopped task.
 FH.Motion = { token = nil, priority = 0, untilAt = 0, aim = nil, sentAt = 0, hum = nil }
 function FH.MotionPriority(token)
-    if type(token) == "table" then return token.priority or 70 end
+    if type(token) == "table" then
+        -- A live capture outranks automatic evasion. Explicit player requests
+        -- keep their own priority and the usual command/manual guards.
+        if token.owner == "rescue" and not token.userRequest and AR.Pending and AR.Pending() then
+            return math.max(token.priority or 50, 90)
+        end
+        return token.priority or 70
+    end
     return 20
 end
 function FH.MotionValid(token)
     if unloaded or token == nil then return false end
     if type(token) == "table" then
         if type(token.ok) ~= "function" or not token.ok() then return false end
+        if token.owner == "evade" and AR.Pending and AR.Pending() then return false end
         if token.owner ~= "command" and not token.userRequest and FH.Prio and FH.Prio() then return false end
         return true
     end
@@ -2683,6 +2691,14 @@ function FH.RecoveryAim(token, hum, goal, intentGoal)
         return goal
     end
     local rp, now = root.Position, os.clock()
+    if Follow.ActiveDrop and Follow.ActiveDrop(token, hum, root) then
+        -- A verified lower waypoint is a committed descent, not a failed
+        -- ground lane. Keep moving into the opening while gravity takes over.
+        if Follow.AirClear(hum, root, goal) then
+            FH.MoveWatch = nil
+            return goal
+        end
+    end
     local dv = Flat(desired - rp)
     if dv.Magnitude <= 0.8 and (math.abs(desired.Y - rp.Y) <= Follow.MaxDY or Flat(goal - rp).Magnitude <= 0.8) then
         FH.MoveWatch = nil
@@ -2824,12 +2840,34 @@ function FH.RecoveryAim(token, hum, goal, intentGoal)
         state.at, state.anchor = now - 0.8, rp
         retry = true
     end
-    if (not retry and now - state.at < 0.8) or now < (state.graceUntil or 0) then return goal end
+    local blocked = FH.BlockedIntent
+    local blockedStep = blocked and Flat(blocked.goal - blocked.pos)
+    local confirmedBlock = blocked ~= nil
+        and blocked.token == token
+        and blocked.hum == hum
+        and blocked.root == root
+        and now - blocked.at < 0.2
+        and Flat(rp - blocked.pos).Magnitude < 0.2
+        and math.abs(feetY - blocked.feetY) < 0.2
+        and blockedStep.Magnitude > 0.1
+        and dv.Magnitude > 0.1
+        and blockedStep.Unit:Dot(dv.Unit) > 0.8
+        and hum.FloorMaterial ~= Enum.Material.Air
+    -- A verified body obstruction need not wait for the generic stall timer.
+    -- Uncertain ground/padding probes still use the normal progress watch.
+    if confirmedBlock then FH.BlockedIntent = nil end
+    if
+        (not retry and not confirmedBlock and now - state.at < 0.8)
+        or (not confirmedBlock and now < (state.graceUntil or 0))
+    then
+        return goal
+    end
     -- A supported stair lane may need another native takeoff after the first
     -- hop lands against its next riser. Give it a bounded retry before marking
-    -- that same uphill route as blocked; actual walls still recover at 0.8s.
+    -- that same uphill route as blocked; a proven obstruction reroutes sooner.
     if
         not retry
+        and not confirmedBlock
         and (state.stairAttempts or 0) < 3
         and FH.TakeoffSupported(hum, root)
         and FH.StairProbe(hum, root, goal)
@@ -2891,6 +2929,7 @@ function FH.Move(token, hum, goal, force, intentGoal)
         if
             not (type(token) == "number" or type(token) == "table" and token.owner == "rescue")
             or not root
+            or (Follow.ActiveDrop and Follow.ActiveDrop(token, hum, root) and Follow.AirClear(hum, root, point))
             or hum.FloorMaterial == Enum.Material.Air
             or FH.IsWorking(token)
             or not FH.LaneRejected(root.Position, point, FH.Feet(hum, root))
@@ -2944,6 +2983,7 @@ function FH.Move(token, hum, goal, force, intentGoal)
 end
 function FH.ReleaseMotion(token, stop)
     if FH.StallIntent and FH.StallIntent.token == token then FH.StallIntent = nil end
+    if FH.BlockedIntent and FH.BlockedIntent.token == token then FH.BlockedIntent = nil end
     if FH.NormalConfirm and FH.NormalConfirm.token == token then FH.NormalConfirm = nil end
     local m = FH.Motion
     if m.token ~= token then return false end
@@ -2960,6 +3000,11 @@ function FH.ReleaseMotion(token, stop)
     return true
 end
 function FH.CancelMotion(owner)
+    local blocked = FH.BlockedIntent
+    if blocked then
+        local name = type(blocked.token) == "table" and (blocked.token.owner or "command") or "follow"
+        if owner == nil or owner == name then FH.BlockedIntent = nil end
+    end
     local intent = FH.StallIntent
     if intent then
         local name = type(intent.token) == "table" and (intent.token.owner or "command") or "follow"
@@ -4244,8 +4289,13 @@ function FH.TraversalLane(token, hum, root, point, feetY, reachLimit, wantWalk)
         }
         return safe, kind, sill
     end
+    -- A thin plane beginning at the root centre misses a prop already touching
+    -- a foot: Roblox shape casts omit their initial overlaps. Sweep that plane
+    -- from just behind the physical body, including both front and rear depth.
+    -- Start above the floor by only a small tolerance so flat trim is visible.
+    local shapeOrigin = Vector3.new(rp.X, feetY + 0.001, rp.Z) - dir * (radius + 0.075)
     local shapeOK, shapeHit =
-        FH.TraversalSweep(root, Vector3.new(rp.X, feetY + 0.03, rp.Z), dir, reach, bodyHeight, radius, 0.05)
+        FH.TraversalSweep(root, shapeOrigin, dir, reach + radius * 2 + 0.075, bodyHeight, radius, 0.05)
     -- Most controller updates are flat, clear movement. One native body
     -- sweep avoids running the detailed obstacle/stair rays on every update.
     if shapeOK and not shapeHit and wantWalk == false then return finish(nil) end
@@ -4261,7 +4311,7 @@ function FH.TraversalLane(token, hum, root, point, feetY, reachLimit, wantWalk)
         else
             -- Decorations can be below the coarse profile's first ray, or
             -- touch only one shoulder. Probe those same physical body lanes.
-            local low = Workspace:Raycast(Vector3.new(origin.X, feetY + 0.08, origin.Z), dir * reach, rayParams)
+            local low = Workspace:Raycast(Vector3.new(origin.X, feetY + 0.002, origin.Z), dir * reach, rayParams)
             if low and low.Normal.Y <= 0.6 then
                 if FH.DoorOf(low.Instance) then return finish(false) end
                 local height = 0.4
@@ -4288,11 +4338,12 @@ function FH.TraversalLane(token, hum, root, point, feetY, reachLimit, wantWalk)
             if candidate >= rise then
                 local ok, blocked = FH.TraversalSweep(
                     root,
-                    Vector3.new(rp.X, feetY + candidate + 0.15, rp.Z),
+                    shapeOrigin + Vector3.new(0, candidate + 0.149, 0),
                     dir,
-                    reach,
+                    reach + radius * 2 + 0.075,
                     bodyHeight,
-                    radius
+                    radius,
+                    0.05
                 )
                 if not ok then break end
                 if not blocked then
@@ -4366,8 +4417,8 @@ function FH.TraversalLane(token, hum, root, point, feetY, reachLimit, wantWalk)
         local origin = rp + across * offset
         if
             Workspace:Raycast(
-                Vector3.new(origin.X, feetY + 0.15, origin.Z),
-                Vector3.new(0, bodyHeight + rise, 0),
+                Vector3.new(origin.X, feetY + rise + 0.15, origin.Z),
+                Vector3.new(0, bodyHeight, 0),
                 rayParams
             )
         then
@@ -7186,6 +7237,11 @@ end
 -- replace a conservative ground-only rejection; other actors retain their scan.
 function Follow.OwnedLaneClear(token, hum, root, from, point, feetY, reach, owned)
     if owned and FH.LaneRejected(from, point, feetY) then return false end
+    if owned and hum and root and (from - root.Position).Magnitude <= 0.2 and point.Y < feetY - 1.5 then
+        -- A native descending leg is a deliberate fall, not an unsupported
+        -- walking shortcut. Its lower landing and entire opening need proof.
+        if Follow.DropLane(hum, root, point, feetY, reach) then return true end
+    end
     local current = owned and hum and root and FH.TraversalLane and (from - root.Position).Magnitude <= 0.2
     local length = math.min(Flat(point - from).Magnitude, reach or math.huge)
     local crossing
@@ -7194,7 +7250,31 @@ function Follow.OwnedLaneClear(token, hum, root, from, point, feetY, reach, owne
         -- immediate swept body even when those ground lanes appear clear.
         -- Open flat lanes take one native query, without detailed floor scans.
         crossing = FH.TraversalLane(token, hum, root, point, feetY, math.min(length, 6), false)
-        if crossing == false then return false end
+        if crossing == false then
+            local blocked, now = FH.BlockedIntent, os.clock()
+            if
+                not (
+                    blocked
+                    and blocked.token == token
+                    and blocked.hum == hum
+                    and blocked.root == root
+                    and now - blocked.at < 0.2
+                    and (blocked.pos - root.Position).Magnitude < 0.2
+                    and math.abs(blocked.feetY - feetY) < 0.2
+                )
+            then
+                FH.BlockedIntent = {
+                    token = token,
+                    hum = hum,
+                    root = root,
+                    pos = root.Position,
+                    goal = point,
+                    feetY = feetY,
+                    at = now,
+                }
+            end
+            return false
+        end
     end
     if Follow.PlanClear(from, point, feetY, reach, nil, nil, owned and FH.BodyRadius(root) or nil) then return true end
     if not current or length <= 0.1 or length > 6 then return false end
@@ -7908,6 +7988,74 @@ function Follow.AirClear(hum, root, point, reachLimit)
     end
     return true
 end
+-- Verify a short native path leg through a floor opening. Do not infer drops
+-- from the final goal alone: the lower waypoint must lie inside a body-wide
+-- opening with a real, unobstructed landing beneath it.
+function Follow.DropLane(hum, root, point, feetY, reachLimit)
+    if not (hum and root and point) or hum.Sit or hum.PlatformStand then return nil end
+    local delta = Flat(point - root.Position)
+    local reach = delta.Magnitude
+    local maxDrop = math.max(Follow.MaxDrop, 32)
+    local drop = feetY - point.Y
+    if drop <= 1.5 or drop > maxDrop or reach > math.min(reachLimit or 6, 6) then return nil end
+    local direction = reach > 0.1 and delta.Unit or Vector3.new(1, 0, 0)
+    local side = Vector3.new(-direction.Z, 0, direction.X)
+    local radius = math.max(root.Size.X, root.Size.Z) * 0.5
+    local headHeight = Follow.BodyH
+    local head = hum.Parent and hum.Parent.FindFirstChild and hum.Parent:FindFirstChild("Head")
+    if head and head:IsA("BasePart") then
+        headHeight = math.max(headHeight, head.Position.Y + head.Size.Y * 0.5 - feetY)
+    end
+    local landingY
+    for _, offset in ipairs({ Vector3.zero, side * radius, -side * radius, direction * radius, -direction * radius }) do
+        local center = point + offset
+        local floor = Workspace:Raycast(
+            Vector3.new(center.X, feetY + 0.15, center.Z),
+            Vector3.new(0, -(drop + 1.5), 0),
+            rayParams
+        )
+        if not floor or floor.Normal.Y < 0.6 or math.abs(floor.Position.Y - point.Y) > 1.25 then return nil end
+        if feetY - floor.Position.Y <= 1.5 then return nil end
+        if landingY and math.abs(floor.Position.Y - landingY) > 0.6 then return nil end
+        landingY = landingY or floor.Position.Y
+        -- A floor panel, overhang or obstruction within the fall column would
+        -- stop the avatar above the intended landing even when X/Z matches.
+        local column = Vector3.new(center.X, floor.Position.Y + 0.12, center.Z)
+        if Workspace:Raycast(column, Vector3.new(0, feetY + headHeight - column.Y, 0), rayParams) then return nil end
+    end
+    if Workspace.Blockcast then
+        -- Sparse edge rays can miss a diagonal corner inside the shaft. Sweep
+        -- the actual body volume through its full fall column and entry lane.
+        local size = Vector3.new(radius * 2, math.max(headHeight - 0.12, 0.2), radius * 2)
+        local center = Vector3.new(point.X, feetY + 0.12 + size.Y * 0.5, point.Z)
+        local ok, hit = pcall(
+            function()
+                return Workspace:Blockcast(CFrame.new(center), size, Vector3.new(0, landingY - feetY, 0), rayParams)
+            end
+        )
+        if ok and hit then return nil end
+        if reach > 0.1 then
+            local entry = Vector3.new(root.Position.X, feetY + 0.12 + size.Y * 0.5, root.Position.Z)
+            ok, hit = pcall(
+                function() return Workspace:Blockcast(CFrame.new(entry), size, direction * reach, rayParams) end
+            )
+            if ok and hit then return nil end
+        end
+    end
+    if reach > 0.1 then
+        for _, offset in ipairs({ 0, radius, -radius }) do
+            for _, height in ipairs({ 0.12, 2.7, headHeight - 0.1 }) do
+                local origin = Vector3.new(root.Position.X, feetY + height, root.Position.Z) + side * offset
+                if Workspace:Raycast(origin, direction * reach, rayParams) then return nil end
+            end
+        end
+    end
+    return Vector3.new(point.X, landingY, point.Z)
+end
+function Follow.ActiveDrop(token, hum, root)
+    local drop = Follow.DropTraversal
+    return drop ~= nil and drop.token == token and drop.hum == hum and drop.root == root and os.clock() < drop.untilAt
+end
 -- Root/trigger heights can differ on the same floor, or nearly match across
 -- two floors. Only a real supporting floor can confirm arrival/contact.
 function Follow.GoalOnFloor(hum, root, goal, ignoreModel)
@@ -7961,6 +8109,7 @@ function Follow.WalkTo(token, getGoal, stopDist, abort, opts)
     local gen, job = 0, nil
     local activePath, blockedConn, blockedAt, jumpIndex
     local jumpTraversal, groundedFeetY
+    local dropTraversal
     local lookaheadCheck = {}
     local pendingSteer = opts.rescueSteer or {}
     local rescueDoorTried = false
@@ -7983,6 +8132,8 @@ function Follow.WalkTo(token, getGoal, stopDist, abort, opts)
         end
         blockedAt = nil
         jumpIndex, jumpTraversal, groundedFeetY = nil, nil, nil
+        if Follow.DropTraversal == dropTraversal then Follow.DropTraversal = nil end
+        dropTraversal = nil
         rescueShortcutAt = -math.huge
         table.clear(lookaheadCheck)
     end
@@ -8010,8 +8161,23 @@ function Follow.WalkTo(token, getGoal, stopDist, abort, opts)
             local point, feetY = w[2].Position, FH.Feet(hum, root)
             -- Retain the first physical crossing, including a low edge missed
             -- by centre rays. Never adopt beyond its still-unperformed jump.
-            if FH.Line(root.Position, point, feetY, point.Y, 1.5) and clearLane(root.Position, point, feetY) then
+            if
+                (Follow.DropLane(hum, root, point, feetY) or FH.Line(root.Position, point, feetY, point.Y, 1.5))
+                and clearLane(root.Position, point, feetY)
+            then
                 index = 2
+            end
+        end
+        if physicalRoute and index == nil and hum and root then
+            -- While ComputeAsync yields, a clear upper-floor side lane can
+            -- pass the path's old lip. Join a nearby, proved lower landing
+            -- directly instead of rejecting that stale entry and circling it.
+            local feetY = FH.Feet(hum, root)
+            for i = 2, math.min(#w, 6) do
+                if Follow.DropLane(hum, root, w[i].Position, feetY) then
+                    index = i
+                    break
+                end
             end
         end
         if physicalRoute and index == nil and not noDoor and hum and root and w[2] then
@@ -8413,6 +8579,27 @@ function Follow.WalkTo(token, getGoal, stopDist, abort, opts)
         FH.RefreshFilter()
         FH.Tick(hum, root)
         local flying = ownedFlight(hum, root, now)
+        if dropTraversal then
+            local drop = dropTraversal
+            if
+                drop.hum ~= hum
+                or drop.root ~= root
+                or now >= drop.untilAt
+                or (hum.FloorMaterial ~= Enum.Material.Air and math.abs(feetY - drop.aim.Y) < 1.5)
+            then
+                if Follow.DropTraversal == drop then Follow.DropTraversal = nil end
+                dropTraversal = nil
+            elseif Follow.Airborne(hum, root) or Follow.DropLane(hum, root, drop.aim, feetY) then
+                -- Continue toward the same opening until landing. Replanning
+                -- at its lip must never choose the upper-floor waypoint behind.
+                if Follow.AirClear(hum, root, drop.aim) then FH.Move(token, hum, drop.aim) end
+                task.wait(0.03)
+                continue
+            else
+                if Follow.DropTraversal == drop then Follow.DropTraversal = nil end
+                dropTraversal = nil
+            end
+        end
         if flying and FH.JumpFlight and FH.JumpFlight.normal and FH.JumpFlight.feetY then
             feetY = FH.JumpFlight.feetY
         end
@@ -8576,6 +8763,30 @@ function Follow.WalkTo(token, getGoal, stopDist, abort, opts)
             aim = goal
         else
             local fp = Vector3.new(rp.X, feetY, rp.Z)
+            if physicalRoute and not flying then
+                -- A lower native waypoint close to the opening commits a
+                -- descent. Ground-only lookahead used to reject this leg and
+                -- pull the avatar back toward the already-passed upper lip.
+                for i = wpi, math.min(#wps, wpi + 2, blockedAt and blockedAt - 1 or #wps) do
+                    local landing = Follow.DropLane(hum, root, wps[i].Position, feetY)
+                    if landing then
+                        wpi, laIdx = i, nil
+                        dropTraversal = {
+                            token = token,
+                            hum = hum,
+                            root = root,
+                            aim = landing,
+                            untilAt = now + 4,
+                            index = i,
+                        }
+                        Follow.DropTraversal = dropTraversal
+                        FH.Move(token, hum, landing)
+                        task.wait(0.03)
+                        break
+                    end
+                end
+                if dropTraversal then continue end
+            end
             if
                 opts.rescueJuke
                 and hum.FloorMaterial ~= Enum.Material.Air
@@ -10690,16 +10901,7 @@ function AH.Unsafe(pos, range)
     if not bp then return false end
     return Flat(pos - bp).Magnitude < (range or AH.AvoidRange)
 end
-function AH.PodsPending()
-    if not AR.Active or FH.AmBeast() or #AR.Pods() == 0 then return false end
-    local threat = AH.Eval()
-    -- Keep an ongoing escape until its normal safe-distance/time checks finish.
-    -- Returning to rescue as soon as the Beast crosses 22 studs causes both
-    -- controllers to reverse direction and repeatedly stop each other's movement.
-    if AH.BusyFlag and AH.State == "flee" then return false end
-    -- An immediate chase keeps its escape lease; resume the rescue after gaining room.
-    return not (threat.danger and (threat.dist <= AH.AvoidRange or FH.ExitOpen() and FH.AnyExitOpen()))
-end
+function AH.PodsPending() return AR.Pending() end
 function AH.Eval()
     local now = os.clock()
     if now - AH.EvalAt < 0.05 then return AH.Last end
@@ -11333,7 +11535,7 @@ function AH.Go(tok)
         task.wait(0.02)
     end
 
-    FH.ReleaseMotion(tok, not Ctl.On())
+    FH.ReleaseMotion(tok, not Ctl.On() and not AH.PodsPending())
 end
 
 function AH.ExitGo(tok)
@@ -11352,13 +11554,17 @@ function AH.ExitGo(tok)
         task.wait(result == "retry" and 0.1 or 0.02)
     end
     Follow.Release(tok)
-    FH.ReleaseMotion(tok, not Ctl.On())
+    FH.ReleaseMotion(tok, not Ctl.On() and not AH.PodsPending())
     return outcome
 end
 function AH.Step(tok)
     local hum, root = GetHumanoid(), RootNow()
     if not FH.MotionAvailable(tok) then
         AH.BusyFlag = false
+        if AH.PodsPending() then
+            FH.ReleaseMotion(tok, false)
+            AH.SetState(AH.Eval().danger and "flee" or "idle")
+        end
         task.wait(0.05)
         return
     end
@@ -11388,7 +11594,8 @@ function AH.Step(tok)
         return
     end
     if AH.PodsPending() then
-        AH.SetState("idle")
+        -- Keep the warning visible while AutoHelp owns the rescue route.
+        AH.SetState(AH.Eval().danger and "flee" or "idle")
         AH.BusyFlag = false
         FH.ReleaseMotion(tok, false)
         task.wait(0.05)
@@ -11579,10 +11786,63 @@ function AR.Pods(ignoreSkip)
     AR.PodAt, AR.PodList = now, res
     return res
 end
+function AR.Pending()
+    if
+        not AR.Active
+        or AR.Request ~= nil
+        or Ctl.On()
+        or Fly.Active
+        or FH.Prio()
+        or not FH.MatchOn()
+        or FH.AmBeast()
+        or not FH.ActiveSurvivor(LocalPlayer)
+        or AH.Down()
+    then
+        return false
+    end
+    local now, map = os.clock(), GetCurrentMap()
+    local cached = AR.PendingPick
+    if cached and AR.PendingMap == map then
+        local info = AR.PodInfo(cached.trig, map)
+        if info and info.occupant == cached.occupant then return true end
+        -- Release/recapture is live, even inside the discovery cache window.
+        AR.PendingPick, AR.PendingAt = nil, nil
+    elseif AR.PendingMap == map and AR.PendingAt and now - AR.PendingAt < 0.05 then
+        local unchanged = AR.PendingCount == #AR.PodTriggers
+        if unchanged then
+            for _, binding in ipairs(AR.PendingSources or {}) do
+                if
+                    not binding.trig.Parent
+                    or binding.torso.Parent ~= binding.trig
+                    or binding.torso.Value ~= binding.value
+                then
+                    unchanged = false
+                    break
+                end
+            end
+        end
+        if unchanged then return false end
+    end
+    -- Route retry backoff chooses between pods; it must not send a lone
+    -- captive back to the escape controller before another rescue attempt.
+    AR.PendingPick = AR.Pods(true)[1]
+    AR.PendingMap, AR.PendingAt = map, now
+    AR.PendingSources, AR.PendingCount = {}, #AR.PodTriggers
+    if not AR.PendingPick then
+        for _, trig in ipairs(AR.PodTriggers) do
+            local torso = trig:FindFirstChild("CapturedTorso")
+            if torso and torso:IsA("ObjectValue") then
+                AR.PendingSources[#AR.PendingSources + 1] = { trig = trig, torso = torso, value = torso.Value }
+            end
+        end
+    end
+    return AR.PendingPick ~= nil
+end
 function AR.Nearest()
     local mr = RootNow()
     if not mr then return nil end
     local pods = AR.Pods()
+    if #pods == 0 then pods = AR.Pods(true) end
     if #pods == 0 then
         AR.Pick = nil
         return nil
@@ -11720,6 +11980,7 @@ function AR.Step(tok)
         or Fly.Active
         or not FH.MatchOn()
         or FH.True(LocalPlayer, FH.BEASTN)
+        or not FH.ActiveSurvivor(LocalPlayer)
         or AH.Down()
     then
         if AR.BusyFlag then AR.Release(tok) end
@@ -11727,7 +11988,7 @@ function AR.Step(tok)
         task.wait(0.2)
         return
     end
-    if AH.BusyFlag or Follow.Rescuing then
+    if Follow.Rescuing then
         AR.Release(tok)
         FH.ReleaseMotion(tok, false)
         AR.SetBusy(false)
@@ -11736,9 +11997,16 @@ function AR.Step(tok)
     end
     local pod = AR.Nearest()
     if not pod then
+        AR.Release(tok)
+        FH.ReleaseMotion(tok, false)
         AR.SetBusy(false)
         task.wait(0.25)
         return
+    end
+    if AH.BusyFlag then
+        AH.BusyFlag = false
+        local motionToken = FH.Motion.token
+        if type(motionToken) == "table" and motionToken.owner == "evade" then FH.ReleaseMotion(motionToken, false) end
     end
     AR.SetBusy(true)
     if Follow.Held or Follow.KeyDown then pcall(Follow.Release) end
@@ -11754,14 +12022,7 @@ function AR.Loop(token)
     local tok = {
         owner = "rescue",
         priority = 50,
-        ok = function()
-            return not unloaded
-                and AR.Active
-                and AR.Token == token
-                and not AH.BusyFlag
-                and not FH.Prio()
-                and not AR.Request
-        end,
+        ok = function() return not unloaded and AR.Active and AR.Token == token and not FH.Prio() and not AR.Request end,
     }
     while not unloaded and AR.Active and AR.Token == token do
         local ok, err = pcall(AR.Step, tok)
