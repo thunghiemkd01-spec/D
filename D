@@ -2572,7 +2572,7 @@ end
 function FH.MotionAvailable(token)
     if not FH.MotionValid(token) then return false end
     local m = FH.Motion
-    return m.token == token or not FH.MotionActive() or FH.MotionPriority(token) > m.priority
+    return m.token == token or not FH.MotionActive() or FH.MotionPriority(token) > FH.MotionPriority(m.token)
 end
 -- Only a live, owned computer/exit interaction may intentionally stand for a long time.
 function FH.MarkWork(token, kind)
@@ -2617,7 +2617,26 @@ end
 -- Feature toggles do not imply hacking: check the live interaction or game state.
 function FH.IsHacking(token)
     if FH.IsWorking(token) and FH.Work.kind == "hack" then return true end
-    if remoteHackEvent and remoteHackEvent.Parent then return true end
+    -- A retained remote target is not proof that this movement owner is
+    -- hacking. It may be on another floor, already finished, or belong to
+    -- Follow while rescue/evasion has taken over the avatar.
+    if remoteHackActive and remoteHackEvent and remoteHackEvent.Parent and (type(token) ~= "table" or token.owner == "follow") then
+        local trigger, root = remoteHackEvent.Parent, RootNow()
+        local computer = trigger.Parent
+        while computer and computer ~= Workspace and computer.Name ~= "ComputerTable" do computer = computer.Parent end
+        if
+            root
+            and trigger:IsA("BasePart")
+            and trigger.Name:sub(1, 15) == "ComputerTrigger"
+            and computer
+            and IsRealComputer(computer, GetCurrentMap())
+            and not IsComputerDone(computer)
+            and (trigger.Position - root.Position).Magnitude <= REMOTE_HACK_RANGE
+            and math.abs(trigger.Position.Y - root.Position.Y) <= Follow.MaxDY
+        then
+            return true
+        end
+    end
     if FH.True(LocalPlayer, FH.HACK_TYPING) then return true end
     local input, event = FH.Stat(LocalPlayer, FH.HACK_INPUT), FH.Stat(LocalPlayer, FH.HACK_EVENT)
     local target = event and event.Value
@@ -2640,6 +2659,7 @@ function FH.AwaitingFloorRoute(token, hum, root)
 end
 function FH.CommittedTraversal(token, hum, root, point)
     if not (hum and root and point) then return false end
+    if FH.ExitTraversalClear and FH.ExitTraversalClear(token, hum, root, point) then return true end
     local crossing = Follow.CrossingTraversal
     if
         Follow.ActiveCrossing
@@ -2667,6 +2687,7 @@ function FH.StallJumpStep()
     if now < (FH.StallCheckAt or 0) then return false end
     FH.StallCheckAt = now + 0.1
     local token, hum, root = state.token, state.hum, state.root
+    if FH.ExitTraversalClear and FH.ExitTraversalClear(token, hum, root, state.goal) then return false end
     if FH.AwaitingFloorRoute(token, hum, root) then return false end
     if
         unloaded
@@ -2817,7 +2838,7 @@ function FH.RecoveryAim(token, hum, goal, intentGoal)
             state.slideCheckAt = now + 0.2
             FH.RefreshFilter()
             local feetY = FH.Feet(hum, root)
-            local floor = Workspace:Raycast(Vector3.new(rp.X, feetY + 1, rp.Z), Vector3.new(0, -4, 0), rayParams)
+            local floor = Workspace:Raycast(Vector3.new(rp.X, feetY + 1, rp.Z), Vector3.new(0, -4, 0), FH.SupportRays)
             state.slideSupported = floor ~= nil
                 and floor.Normal.Y > 0.1
                 and math.abs(floor.Position.Y - feetY) <= 1.5
@@ -2954,10 +2975,10 @@ function FH.RecoveryAim(token, hum, goal, intentGoal)
     -- into them. Probe a bounded set only when stalled, never each frame.
     local pick
     for _, dir in ipairs({
-        side,
-        -side,
         forward * 0.5 + side * 0.866,
         forward * 0.5 - side * 0.866,
+        side,
+        -side,
         -forward * 0.5 + side * 0.866,
         -forward * 0.5 - side * 0.866,
         forward,
@@ -3021,6 +3042,7 @@ function FH.Move(token, hum, goal, force, intentGoal)
     if rejected(goal) then return false end
     local m, now = FH.Motion, os.clock()
     if m.token ~= token or m.hum ~= hum then
+        if FH.NormalConfirm and FH.NormalConfirm.token ~= token then FH.NormalConfirm = nil end
         m.token, m.hum, m.priority = token, hum, FH.MotionPriority(token)
         m.aim, m.sentAim, m.sentAt = nil, nil, 0
     end
@@ -3030,6 +3052,19 @@ function FH.Move(token, hum, goal, force, intentGoal)
     -- orders are throttled, so a short next waypoint cannot leave Move(0) at
     -- the previous cached point while waiting for its refresh timer.
     m.aim = goal
+    local flight = FH.JumpFlight
+    if
+        flight
+        and flight.token == token
+        and flight.hum == hum
+        and flight.root == root
+        and now - flight.t <= 0.08
+        and not FH.NormalConfirm
+    then
+        -- A takeover may request its jump just before its first Move. Confirm
+        -- only that task's new takeoff once its accepted lease exists.
+        FH.ConfirmNormalTakeoff(hum, root, token)
+    end
     if force or not m.sentAim or (goal - m.sentAim).Magnitude >= 0.7 or now - m.sentAt >= 0.45 then
         m.sentAim, m.sentAt = goal, now
         hum:MoveTo(goal)
@@ -3050,7 +3085,38 @@ function FH.Move(token, hum, goal, force, intentGoal)
     end
     return true
 end
+-- Keep an already proved leg moving during an asynchronous route request.
+-- This cannot acquire an owner's motion, revive an expired lease, or drive
+-- beyond the current destination while its replacement is being calculated.
+function FH.CarryMotion(token, hum, root, seconds)
+    local m = FH.Motion
+    if
+        not (hum and root)
+        or m.token ~= token
+        or m.hum ~= hum
+        or hum.RootPart ~= root
+        or not m.aim
+        or not FH.MotionActive()
+        or Ctl.On()
+        or Fly.Active
+        or FH.IsWorking(token)
+        or FH.IsHacking(token)
+        or hum.Health <= 0
+        or hum.Sit
+        or hum.PlatformStand
+    then
+        return false
+    end
+    local distance = Flat(m.aim - root.Position).Magnitude
+    if distance <= 0.5 then return false end
+    local reach = math.min(distance, 6)
+    local safe, kind = FH.TraversalLane(token, hum, root, m.aim, FH.Feet(hum, root), reach, true, true)
+    if not safe or kind == "jump" or kind == "jump2" then return false end
+    m.untilAt = math.max(m.untilAt, os.clock() + math.clamp(seconds or 0.75, 0, 0.9))
+    return true
+end
 function FH.ReleaseMotion(token, stop)
+    if FH.ExitTraversal and FH.ExitTraversal.token == token then FH.ExitTraversal = nil end
     if FH.ForwardPulse and FH.ForwardPulse.token == token then FH.ReleaseForward() end
     if FH.VerticalRouteWait and FH.VerticalRouteWait.token == token then FH.VerticalRouteWait = nil end
     if Follow.CrossingTraversal and Follow.CrossingTraversal.token == token then Follow.CrossingTraversal = nil end
@@ -3080,6 +3146,7 @@ function FH.CancelMotion(owner)
         if owner == nil or owner == name then FH.ReleaseForward(pulse) end
     end
     for _, entry in ipairs({
+        { FH, "ExitTraversal" },
         { FH, "VerticalRouteWait" },
         { FH, "BlockedIntent" },
         { Follow, "CrossingTraversal" },
@@ -3104,6 +3171,7 @@ function FH.CancelMotion(owner)
 end
 local function TokOK(token) return FH.MotionValid(token) and FH.MotionAvailable(token) end
 function FH.ResetCaches(keep)
+    FH.ExitTraversal = nil
     FH.VerticalRouteWait, Follow.CrossingTraversal, Follow.DropTraversal = nil, nil, nil
     if FH.ForwardPulse then FH.ReleaseForward() end
     FH.Jmp = nil
@@ -3184,7 +3252,8 @@ end
 function FH.RejectLane(token, hum, goal, seconds)
     local root = hum and hum.RootPart
     if
-        type(token) ~= "number"
+        (type(token) ~= "number" and not (type(token) == "table" and token.owner == "rescue"))
+        or not FH.MotionValid(token)
         or not root
         or not goal
         or hum.Health <= 0
@@ -3299,14 +3368,32 @@ function FH.CanHold(st, dist, close, far)
 end
 function FH.RefreshFilter()
     local now = os.clock()
-    if now - rayFilterAt < 1.0 then return end
+    local map = GetCurrentMap()
+    if now - rayFilterAt < 0.35 and FH.FilterMap == map and FH.FilterComputerCount == #Computers then return end
     rayFilterAt = now
     local f = {}
     if InvisBody.Model then f[#f + 1] = InvisBody.Model end
     for _, pl in ipairs(Players:GetPlayers()) do
         if pl.Character then f[#f + 1] = pl.Character end
     end
+    -- Computers are interaction destinations, not obstacles. Keep their
+    -- desktops out of navigation grounding as well as horizontal body rays,
+    -- while actual takeoff still observes the support beneath the avatar.
+    if not FH.SupportRays then
+        FH.SupportRays = RaycastParams.new()
+        FH.SupportRays.FilterType = Enum.RaycastFilterType.Exclude
+        pcall(function() FH.SupportRays.RespectCanCollide = true end)
+    end
+    FH.SupportRays.FilterDescendantsInstances = table.clone(f)
+    for _, computer in ipairs(Computers) do
+        if IsRealComputer(computer, map) then f[#f + 1] = computer end
+    end
     rayParams.FilterDescendantsInstances = f
+    FH.FilterMap, FH.FilterComputerCount = map, #Computers
+end
+function FH.NavigationFilter()
+    FH.RefreshFilter()
+    return rayParams
 end
 function FH.Stat(p, names)
     local ts = p and p:FindFirstChild("TempPlayerStatsModule")
@@ -3721,7 +3808,7 @@ function FH.TakeoffSupported(hum, root)
     FH.RefreshFilter()
     local feetY = FH.Feet(hum, root)
     local floor =
-        Workspace:Raycast(Vector3.new(root.Position.X, feetY + 0.35, root.Position.Z), Vector3.new(0, -1, 0), rayParams)
+        Workspace:Raycast(Vector3.new(root.Position.X, feetY + 0.35, root.Position.Z), Vector3.new(0, -1, 0), FH.SupportRays)
     return floor ~= nil
         and floor.Normal.Y > 0.25
         and math.abs(floor.Position.Y - feetY) <= 0.45
@@ -3869,8 +3956,10 @@ function FH.NoteNormalTakeoff()
         ticket.started = true
     end
 end
-function FH.Jump(hum, dbl)
+function FH.Jump(hum, dbl, owner)
     if dbl == nil then dbl = true end
+    local token = owner or (FH.Motion and FH.Motion.token)
+    if owner ~= nil and not FH.MotionAvailable(owner) then return false end
     local now = os.clock()
     if
         unloaded
@@ -3881,11 +3970,11 @@ function FH.Jump(hum, dbl)
         or now - FH.LastJump < 0.5
         or Ctl.On()
         or Fly.Active
-        or FH.IsWorking(FH.Motion and FH.Motion.token)
-        or FH.IsHacking(FH.Motion and FH.Motion.token)
+        or FH.IsWorking(token)
+        or FH.IsHacking(token)
         or FH.True(LocalPlayer, FH.CAP)
         or FH.True(LocalPlayer, FH.RAG)
-        or (Follow.InputOwner == (FH.Motion and FH.Motion.token) and (Follow.Held or Follow.KeyDown))
+        or (Follow.InputOwner == token and (Follow.Held or Follow.KeyDown))
         or AR.Held
         or AR.KeyDown
         or TR.Held
@@ -3893,7 +3982,7 @@ function FH.Jump(hum, dbl)
     then
         return false
     end
-    if hum.FloorMaterial == Enum.Material.Air then return false end
+    if not FH.TakeoffSupported(hum, hum.RootPart) then return false end
     -- A Space press and a forced state change in the same frame competed with
     -- the game's own jump controller. Keep exactly one first-jump request.
     local pressed, reason = FH.Space(true)
@@ -3902,7 +3991,7 @@ function FH.Jump(hum, dbl)
         hum:ChangeState(Enum.HumanoidStateType.Jumping)
     end
     FH.LastJump = now
-    FH.JumpFlight = { t = now, hum = hum, root = hum.RootPart, airborne = false, token = FH.Motion and FH.Motion.token }
+    FH.JumpFlight = { t = now, hum = hum, root = hum.RootPart, airborne = false, token = token }
     FH.Jmp = dbl
             and {
                 t = now,
@@ -3911,7 +4000,8 @@ function FH.Jump(hum, dbl)
                 root = hum.RootPart,
                 airborne = false,
                 character = LocalPlayer.Character,
-                token = FH.Motion and FH.Motion.token,
+                token = token,
+                firstPulse = FH.SpacePulse,
             }
         or nil
     return true
@@ -3966,7 +4056,7 @@ function FH.Tick(hum, root)
         or TR.Held
         or TR.KeyDown
         or UserInputService:GetFocusedTextBox()
-        or UserInputService:IsKeyDown(Enum.KeyCode.Space)
+        or (UserInputService:IsKeyDown(Enum.KeyCode.Space) and not (FH.SpacePulse and FH.SpacePulse.ownedJump))
     then
         FH.Jmp = nil
         return
@@ -3980,12 +4070,17 @@ function FH.Tick(hum, root)
     end
     -- The second press belongs to a real airborne first jump, never a delayed takeoff.
     if j.done or not airborne or el < 0.14 then return end
-    if root.AssemblyLinearVelocity.Y < 10 or el > 0.34 then
-        j.done = true
+    if j.firstPulse and not j.firstPulse.releasedAt then return end
+    if os.clock() < (j.retryAt or 0) then return end
+    if root.AssemblyLinearVelocity.Y < 10 or el > 0.28 then
         -- The game's controller decides whether this second real Space press
         -- is a valid double jump. Never force Jumping while already airborne.
-        FH.Space(true)
+        j.done = FH.Space(true) == true
+        j.retryAt = os.clock() + 0.04
     end
+end
+function FH.JumpTickStep()
+    FH.Tick(GetHumanoid(), RootNow())
 end
 -- Share repeated obstacle probes within a small movement/time window. The
 -- planner/scanner still uses fresh FH.Profile calls and independent ray filters.
@@ -4188,6 +4283,7 @@ function FH.StairJumpStep()
     if not motion or motion.token == nil or not motion.aim then return false end
     local now = os.clock()
     local hum, root = GetHumanoid(), RootNow()
+    if FH.ExitTraversalClear and FH.ExitTraversalClear(motion.token, hum, root, motion.aim) then return false end
     if FH.AwaitingFloorRoute(motion.token, hum, root) then return false end
     if
         unloaded
@@ -4544,6 +4640,7 @@ function FH.MotionGuardedStep(name)
     return ok
 end
 function FH.MotionStep()
+    FH.MotionGuardedStep("JumpTickStep")
     FH.MotionGuardedStep("NoteNormalTakeoff")
     FH.MotionGuardedStep("StairJumpStep")
     FH.MotionGuardedStep("StallJumpStep")
@@ -4563,6 +4660,7 @@ function FH.ReleaseSpace(pulse)
     pulse = pulse or FH.SpacePulse
     if not pulse or FH.SpacePulse ~= pulse then return false end
     FH.SpacePulse = nil
+    pulse.releasedAt = os.clock()
     Ctl.SpaceUntil = os.clock() + 0.3
     if pulse.ownedJump then FH.OwnJumpUntil = os.clock() + 0.06 end
     if pulse.release then
@@ -4731,16 +4829,22 @@ function FH.TraversalLane(token, hum, root, point, feetY, reachLimit, wantWalk, 
         }
         return safe, kind, sill
     end
-    -- A thin plane beginning at the root centre misses a prop already touching
-    -- a foot: Roblox shape casts omit their initial overlaps. Sweep that plane
-    -- from just behind the physical body, including both front and rear depth.
-    -- Start above the floor by only a small tolerance so flat trim is visible.
-    local shapeOrigin = Vector3.new(rp.X, feetY + 0.001, rp.Z) - dir * (radius + 0.075)
+    -- Sweep the actual forward body corridor. A plane started behind the
+    -- avatar also saw nearby rear props and geometry beyond this destination,
+    -- turning harmless surroundings into repeated stop/jump requests. The
+    -- offset profile rays below still catch props touching the front feet.
+    local shapeOrigin = Vector3.new(rp.X, feetY + 0.12, rp.Z)
     local shapeOK, shapeHit =
-        FH.TraversalSweep(root, shapeOrigin, dir, reach + radius * 2 + 0.075, bodyHeight, radius, 0.05)
+        FH.TraversalSweep(root, shapeOrigin, dir, reach, bodyHeight, radius)
     -- Most controller updates are flat, clear movement. One native body
     -- sweep avoids running the detailed obstacle/stair rays on every update.
-    if shapeOK and not shapeHit and wantWalk == false then return finish(nil) end
+    if shapeOK and not shapeHit and wantWalk == false then
+        -- Shape casts omit initial overlaps. Retain the cheap centre profile
+        -- for a prop already touching the avatar instead of sweeping backwards
+        -- into unrelated rear geometry to find it.
+        local contactKind = FH.MotionProfile(hum, root, point, feetY, reach)
+        if not contactKind then return finish(nil) end
+    end
     if shapeHit or not shapeOK then
         local stairFloor = FH.TraversalStairs(root, dir, feetY, reach, radius, bodyHeight)
         if stairFloor then return finish(true, "stairs", stairFloor - feetY) end
@@ -4786,10 +4890,9 @@ function FH.TraversalLane(token, hum, root, point, feetY, reachLimit, wantWalk, 
                     root,
                     shapeOrigin + Vector3.new(0, candidate + 0.149, 0),
                     dir,
-                    reach + radius * 2 + 0.075,
+                    reach,
                     bodyHeight,
-                    radius,
-                    0.05
+                    radius
                 )
                 if not ok then break end
                 if not blocked then
@@ -4900,8 +5003,10 @@ function FH.TraversalLane(token, hum, root, point, feetY, reachLimit, wantWalk, 
     end
     return finish(true, rise > singleJump and "jump2" or "jump", rise)
 end
-function FH.TryJump(hum, root, aim, feetY, kind, sill)
-    local token = FH.Motion and FH.Motion.token
+function FH.TryJump(hum, root, aim, feetY, kind, sill, owner)
+    local token = owner or (FH.Motion and FH.Motion.token)
+    if owner ~= nil and not FH.MotionAvailable(owner) then return false end
+    if FH.ExitTraversalClear and FH.ExitTraversalClear(token, hum, root, aim) then return false end
     if FH.AwaitingFloorRoute(token, hum, root) then return false end
     local scoped = FH.TraversalOwned(token)
     if
@@ -4915,11 +5020,11 @@ function FH.TryJump(hum, root, aim, feetY, kind, sill)
         or Fly.Active
         or EM.ComboState
         or UserInputService:GetFocusedTextBox()
-        or FH.IsWorking(FH.Motion and FH.Motion.token)
-        or FH.IsHacking(FH.Motion and FH.Motion.token)
+        or FH.IsWorking(token)
+        or FH.IsHacking(token)
         or FH.True(LocalPlayer, FH.CAP)
         or FH.True(LocalPlayer, FH.RAG)
-        or (Follow.InputOwner == (FH.Motion and FH.Motion.token) and (Follow.Held or Follow.KeyDown))
+        or (Follow.InputOwner == token and (Follow.Held or Follow.KeyDown))
         or AR.Held
         or AR.KeyDown
         or TR.Held
@@ -4992,9 +5097,9 @@ function FH.TryJump(hum, root, aim, feetY, kind, sill)
     local landing = rp + delta.Unit * reach
     if not scopedSafe and not Follow.PlanClear(rp, landing, feetY, reach) then return false end
     -- A refused jump must not restart movement while waiting for its cooldown.
-    if not FH.Jump(hum, kind == "jump2" or (sill or 0) > Follow.DoubleFrom) then return false end
+    if not FH.Jump(hum, kind == "jump2" or (sill or 0) > Follow.DoubleFrom, owner) then return false end
     hum:MoveTo(aim)
-    FH.ConfirmNormalTakeoff(hum, root, FH.Motion and FH.Motion.token)
+    FH.ConfirmNormalTakeoff(hum, root, token)
     return true
 end
 function FH.Unstick(hum, root, token, goal, dur)
@@ -5065,7 +5170,7 @@ function FH.Unstick(hum, root, token, goal, dur)
     end
 end
 function FH.Ground(pos, settings)
-    local params = settings or rayParams
+    local params = settings or FH.NavigationFilter()
     local r = Workspace:Raycast(pos + Vector3.new(0, 3, 0), Vector3.new(0, -40, 0), params)
     -- A raised sample can start above a low ceiling. Never turn that ceiling
     -- into the destination floor for a root/trigger underneath it.
@@ -5720,30 +5825,89 @@ function FH.Nav.OnReset()
     nav.PriorityLinks, nav.PriorityLinkHead, nav.PriorityAt, nav.PriorityPoints = {}, 1, 0, {}
     nav.IgnoreCache, nav.Portals, nav.PortalIds, nav.NextPortal, nav.LastRoute = {}, {}, {}, 0, nil
     nav.Topology, nav.RouteCache, nav.RouteCacheOrder = 0, {}, {}
+    nav.GeometryRevision, nav.AreaQueued, nav.AreaQueuedAt = 0, {}, 0
     nav.CurrentGoal, nav.PromotedAreas, nav.PromotedAt = nil, {}, 0
     nav.LinkBuckets, nav.PromotionJobs, nav.PromotionHead, nav.PendingPromotions = {}, {}, 1, {}
     if FH.LiveLanes then FH.LiveLanes = { lanes = {}, revision = FH.LiveLanes.revision + 1 } end
 end
-function FH.Nav.ParamsFor(ignore)
+function FH.Nav.BuildParams(ignore)
     local nav = FH.Nav
-    if not ignore or not nav.Map or not ignore:IsDescendantOf(nav.Map) then return nav.Params end
-    local cached = nav.IgnoreCache[ignore]
-    if cached and cached.version == nav.Version then return cached.params end
-    -- Include siblings along the ancestry chain: only this one model is excluded.
-    local included, current = {}, ignore
-    while current and current ~= nav.Map do
-        local parent = current.Parent
-        if not parent then return nav.Params end
-        for _, child in ipairs(parent:GetChildren()) do
-            if child ~= current then included[#included + 1] = child end
+    local blocked, split, included = {}, {}, {}
+    local function exclude(instance)
+        if not instance or not instance.Parent or not instance:IsDescendantOf(nav.Map) then return end
+        blocked[instance] = true
+        local parent = instance.Parent
+        while parent do
+            split[parent] = true
+            if parent == nav.Map then break end
+            parent = parent.Parent
         end
-        current = parent
+    end
+    for _, instance in ipairs(nav.Exclusions or {}) do exclude(instance) end
+    exclude(ignore)
+    -- Split only ancestors of excluded computers/characters. Whole unaffected
+    -- map branches stay included without enumerating every part or other maps.
+    local stack = { nav.Map }
+    while #stack > 0 do
+        local current = table.remove(stack)
+        if not blocked[current] then
+            if split[current] then
+                for _, child in ipairs(current:GetChildren()) do stack[#stack + 1] = child end
+            else
+                included[#included + 1] = current
+            end
+        end
     end
     local settings = RaycastParams.new()
     settings.FilterType = Enum.RaycastFilterType.Include
     settings.FilterDescendantsInstances = included
     settings.RespectCanCollide = true
-    nav.IgnoreCache[ignore] = { version = nav.Version, params = settings }
+    return settings, blocked, split
+end
+function FH.Nav.RefreshParams(force)
+    local nav, now = FH.Nav, os.clock()
+    if not (nav.Map and nav.Map.Parent) then return nil end
+    if not force and not nav.FilterDirty and now < (nav.FilterAt or 0) then return nav.Params end
+    nav.FilterAt = now + 0.25
+    local source = FH.NavigationFilter and FH.NavigationFilter() or rayParams
+    local exclusions, set, changed = {}, {}, nav.Params == nil
+    for _, instance in ipairs(source.FilterDescendantsInstances) do
+        if instance.Parent and instance:IsDescendantOf(nav.Map) and not set[instance] then
+            set[instance] = true
+            exclusions[#exclusions + 1] = instance
+            if not (nav.ExcludeSet and nav.ExcludeSet[instance]) then changed = true end
+        end
+    end
+    for instance in pairs(nav.ExcludeSet or {}) do
+        if not set[instance] then changed = true end
+    end
+    if changed or nav.FilterDirty then
+        local previous = nav.Exclusions
+        nav.Exclusions, nav.ExcludeSet = exclusions, set
+        nav.Params, nav.ExcludeSet, nav.FilterSplitParents = nav.BuildParams()
+        nav.FilterRevision = (nav.FilterRevision or 0) + 1
+        nav.IgnoreCache, nav.FilterDirty = {}, false
+        -- A newly identified computer must also remove its old tabletop samples.
+        if changed and previous and nav.FilterChanged then nav.FilterChanged(previous, exclusions) end
+    end
+    return nav.Params
+end
+function FH.Nav.IsIgnored(instance)
+    local nav = FH.Nav
+    while instance and instance ~= nav.Map do
+        if nav.ExcludeSet and nav.ExcludeSet[instance] then return true end
+        instance = instance.Parent
+    end
+    return false
+end
+function FH.Nav.ParamsFor(ignore)
+    local nav = FH.Nav
+    local base = nav.RefreshParams()
+    if not ignore or not nav.Map or not ignore:IsDescendantOf(nav.Map) or nav.IsIgnored(ignore) then return base end
+    local cached = nav.IgnoreCache[ignore]
+    if cached and cached.revision == nav.FilterRevision then return cached.params end
+    local settings = nav.BuildParams(ignore)
+    nav.IgnoreCache[ignore] = { revision = nav.FilterRevision, params = settings }
     return settings
 end
 function FH.Nav.Floor(pos, ignore)
@@ -6749,7 +6913,7 @@ do
         Nav.TotalColumns = (b.maxIX - b.minIX + 1) * (b.maxIZ - b.minIZ + 1)
     end
     local function navExpand(part)
-        if not part.CanCollide then return end
+        if not part.CanCollide or Nav.IsIgnored(part) then return end
         local low, high = navBox(part.CFrame, part.Size)
         if not low then return end
         local b = Nav.Bounds
@@ -6818,6 +6982,25 @@ do
             iz = minIZ,
         }
     end
+    function Nav.FilterChanged(previous, current)
+        if Nav.NodeCount == 0 then return end
+        local before, after = {}, {}
+        for _, instance in ipairs(previous) do before[instance] = true end
+        for _, instance in ipairs(current) do after[instance] = true end
+        local function dirty(instance)
+            local ok, cf, size = pcall(function()
+                if instance:IsA("BasePart") then return instance.CFrame, instance.Size end
+                if instance:IsA("Model") then return instance:GetBoundingBox() end
+            end)
+            if ok and cf and size then navDirtyGeometry({ cf = cf, size = size, collide = true }) end
+        end
+        for instance in pairs(before) do
+            if not after[instance] then dirty(instance) end
+        end
+        for instance in pairs(after) do
+            if not before[instance] then dirty(instance) end
+        end
+    end
     local function navDirtyStep()
         local region = Nav.DirtyRegions[Nav.DirtyRegionHead]
         if not region then return false end
@@ -6837,10 +7020,10 @@ do
         return true
     end
     local function navTrackPart(part, generation)
-        if not part:IsA("BasePart") or Nav.PartConnections[part] then return end
+        if not part:IsA("BasePart") or Nav.PartConnections[part] or Nav.IsIgnored(part) then return end
         local observed = navSnapshot(part)
         local connection = part.Changed:Connect(function(property)
-            if Nav.Generation ~= generation or not Nav.Map then return end
+            if Nav.Generation ~= generation or not Nav.Map or Nav.IsIgnored(part) then return end
             if
                 property ~= "CanCollide"
                 and property ~= "CFrame"
@@ -6873,6 +7056,8 @@ do
             node.live = false
         end
         Nav.Map, Nav.Params, Nav.Bounds, Nav.ColumnJob = nil, nil, nil, nil
+        Nav.Exclusions, Nav.ExcludeSet, Nav.FilterSplitParents = {}, {}, {}
+        Nav.FilterDirty, Nav.FilterAt, Nav.FilterRevision = false, 0, (Nav.FilterRevision or 0) + 1
         Nav.Nodes, Nav.Columns, Nav.NodeCount = {}, {}, 0
         Nav.PendingColumns, Nav.PriorityColumns, Nav.PriorityHead = {}, {}, 1
         Nav.GeometryPending = setmetatable({}, { __mode = "k" })
@@ -6891,6 +7076,8 @@ do
             node.live = false
         end
         Nav.Map, Nav.Params, Nav.Bounds, Nav.ColumnJob = nil, nil, nil, nil
+        Nav.Exclusions, Nav.ExcludeSet, Nav.FilterSplitParents = {}, {}, {}
+        Nav.FilterDirty, Nav.FilterAt, Nav.FilterRevision = false, 0, (Nav.FilterRevision or 0) + 1
         Nav.Nodes, Nav.Columns, Nav.NodeCount = {}, {}, 0
         Nav.PendingColumns, Nav.PriorityColumns, Nav.PriorityHead = {}, {}, 1
         Nav.GeometryPending = setmetatable({}, { __mode = "k" })
@@ -6908,17 +7095,16 @@ do
             return
         end
         Nav.Map, Nav.Status = map, "scanning"
-        local settings = RaycastParams.new()
-        settings.FilterType = Enum.RaycastFilterType.Include
-        settings.FilterDescendantsInstances = { map }
-        settings.RespectCanCollide = true
-        Nav.Params = settings
+        Nav.RefreshParams(true)
         local generation = Nav.Generation
         -- Enumerating loaded descendants is native; inspecting them is budgeted in Step.
         Nav.BoundsParts, Nav.BoundsAt = map:GetDescendants(), 1
         local added = map.DescendantAdded:Connect(function(part)
-            if Nav.Generation ~= generation or not part:IsA("BasePart") then return end
+            if Nav.Generation ~= generation then return end
+            if Nav.FilterSplitParents[part.Parent] then Nav.FilterDirty = true end
+            if Nav.IsIgnored(part) then return end
             Nav.IgnoreCache = {}
+            if not part:IsA("BasePart") then return end
             navTrackPart(part, generation)
             local changed = navExpand(part)
             if changed and not Nav.BoundsParts then navGridBounds() end
@@ -6928,10 +7114,12 @@ do
             end
         end)
         local removed = map.DescendantRemoving:Connect(function(part)
-            if Nav.Generation ~= generation or not part:IsA("BasePart") then return end
-            Nav.IgnoreCache = {}
-            local old = Nav.PartSnapshots[part] or navSnapshot(part)
-            if old.collide then
+            if Nav.Generation ~= generation then return end
+            if Nav.FilterSplitParents[part.Parent] then Nav.FilterDirty = true end
+            if not Nav.IsIgnored(part) then Nav.IgnoreCache = {} end
+            if not part:IsA("BasePart") then return end
+            local old = not Nav.IsIgnored(part) and (Nav.PartSnapshots[part] or navSnapshot(part))
+            if old and old.collide then
                 if not Nav.GeometryPending[part] then Nav.GeometryQueue[#Nav.GeometryQueue + 1] = part end
                 Nav.GeometryPending[part] =
                     { before = old, removed = true, at = navClock() + 0.04, generation = generation }
@@ -6949,8 +7137,13 @@ do
     function Nav.QueueArea(position, radius)
         if not Nav.Map or not navPosition(position) then return end
         if Nav.PromoteArea then Nav.PromoteArea(position) end
-        local cell, r = Nav.Cell, math.min(radius or 24, 64)
+        local cell, r = Nav.Cell, math.clamp(radius or 24, 0, 64)
         local ix, iz = math.floor(position.X / cell + 0.5), math.floor(position.Z / cell + 0.5)
+        local now = navClock()
+        if now >= (Nav.AreaQueuedAt or 0) then Nav.AreaQueued, Nav.AreaQueuedAt = {}, now + 5 end
+        local area = ix .. ":" .. iz .. ":" .. math.floor(position.Y / cell) .. ":" .. r
+        if now < (Nav.AreaQueued[area] or 0) then return end
+        Nav.AreaQueued[area] = now + 0.6
         local reach = math.ceil(r / cell)
         -- Center first: urgent corridors become available before the far map perimeter.
         for ring = 0, reach do
@@ -6967,14 +7160,17 @@ do
         end
     end
     local function navInvalidateColumn(column)
+        local changed = false
         for _, node in ipairs(column.nodes or {}) do
             if node.live then
+                changed = true
                 node.live = false
                 Nav.NodeCount = math.max(0, Nav.NodeCount - 1)
                 if node.id and Nav.Nodes[node.id] == node then Nav.Nodes[node.id] = nil end
             end
         end
         column.nodes, column.scanned, column.unknown = {}, false, false
+        if changed then Nav.Topology = (Nav.Topology or 0) + 1 end
     end
     -- One downward surface per invocation, retaining a job across task ticks.
     function Nav.ScanColumn(ix, iz)
@@ -7086,7 +7282,11 @@ do
             elseif now >= pending.at then
                 Nav.GeometryPending[part] = nil
                 local before = pending.before
-                local after = not pending.removed and part.Parent and part:IsDescendantOf(Nav.Map) and navSnapshot(part)
+                local after = not pending.removed
+                    and part.Parent
+                    and part:IsDescendantOf(Nav.Map)
+                    and not Nav.IsIgnored(part)
+                    and navSnapshot(part)
                 if
                     ((before and before.collide) or (after and after.collide))
                     and (pending.removed or (after and navChanged(before, after)))
@@ -7112,7 +7312,10 @@ do
             Nav.GeometryQueue, Nav.GeometryHead = remaining, 1
         end
         if changed then
-            Nav.Version = (Nav.Version or 0) + 1
+            -- Settled geometry affects only nearby columns. Unrelated doors or
+            -- decorations do not cancel every in-flight route on the map.
+            -- Selected routes still receive live clearance probes before use.
+            Nav.GeometryRevision = (Nav.GeometryRevision or 0) + 1
             if Nav.Status == "ready" then Nav.Status = "scanning" end
         end
     end
@@ -7120,6 +7323,7 @@ do
         if not Nav.Map or not Nav.Map.Parent or unloaded then return end
         local started, steps = navClock(), 0
         local deadline = started + (budget or 0.0015)
+        Nav.RefreshParams()
         -- This list is also used to attach settled-geometry listeners incrementally.
         if Nav.BoundsParts then
             local list, index = Nav.BoundsParts, Nav.BoundsAt
@@ -7140,9 +7344,13 @@ do
         if not Nav.Bounds then return end
         navFlushGeometry(started, deadline)
         if started >= (Nav.AreaAt or 0) and navClock() < deadline then
-            Nav.AreaAt = started + 0.6
+            Nav.AreaAt = started + 0.25
             local root = RootNow()
             if root then Nav.QueueArea(root.Position, 24) end
+            if Nav.CurrentGoal then Nav.QueueArea(Nav.CurrentGoal, 20) end
+            if AH.Active and AH.Dir and root then Nav.QueueArea(root.Position + AH.Dir * 20, 16) end
+            local rescue = AR.Active and (AR.Pick or AR.PendingPick)
+            if rescue and rescue.trig and rescue.trig.Parent then Nav.QueueArea(rescue.trig.Position, 20) end
             local target = Follow.Target
             local character = target and target.Character
             local targetRoot = character and character:FindFirstChild("HumanoidRootPart")
@@ -7200,7 +7408,11 @@ do
         task.spawn(function()
             while not unloaded and Nav.Running and Nav.WorkerGeneration == workerGeneration do
                 local now = navClock()
-                local active = Follow.Target ~= nil or Follow.AutoFarm or (FH.MotionActive and FH.MotionActive())
+                local active = Follow.Target ~= nil
+                    or Follow.AutoFarm
+                    or AH.Active
+                    or AR.Active
+                    or (FH.MotionActive and FH.MotionActive())
                 if (active or Nav.Map) and now >= (Nav.LastMapCheck or 0) then
                     Nav.LastMapCheck = now + 0.5
                     local map = GetCurrentMap()
@@ -7395,7 +7607,7 @@ function Follow.Push(token, point, secs, abort, stopD, door)
         FH.Move(token, hum, point)
 
         local kind, sill = FH.Profile(rp.X, rp.Z, flat.Unit, feetY, 3.0)
-        if kind == "jump" or kind == "jump2" then FH.Jump(hum, kind == "jump2" or sill > Follow.DoubleFrom) end
+        if kind == "jump" or kind == "jump2" then FH.Jump(hum, kind == "jump2" or sill > Follow.DoubleFrom, token) end
 
         local now = os.clock()
         if now - lastChk > 0.4 then
@@ -7404,7 +7616,7 @@ function Follow.Push(token, point, secs, abort, stopD, door)
                     stuckAt = stuckAt or lastChk
                     if now - stuckAt >= 0.8 then break end
                 elseif kind ~= "door" and kind ~= "wall" then
-                    FH.Jump(hum, true)
+                    FH.Jump(hum, true, token)
                 end
             else
                 stuckAt = nil
@@ -7946,7 +8158,7 @@ function Follow.CommitCrossing(plan)
 end
 function Follow.StartDrop(token, hum, root, landing, crossing, index)
     if not landing then return nil end
-    if crossing and not FH.Jump(hum, crossing.double) then return nil end
+    if crossing and not FH.Jump(hum, crossing.double, token) then return nil end
     if crossing then FH.BindNativeFlight(token, hum, root) end
     local drop = {
         token = token,
@@ -8032,7 +8244,7 @@ function Follow.ActiveEscape(token, hum, root)
         and recovery.escape ~= nil
         and os.clock() < (recovery.escapeUntil or 0)
 end
-function Follow.PlanStep(token, hum, root, goal, feetY, state, rescueGoal)
+function Follow.PlanStep(token, hum, root, goal, feetY, state, rescueGoal, approachModel)
     if not TokOK(token) or Ctl.On() or Fly.Active then return false end
     -- The shared motion controller validates the committed side lane. Probing
     -- the old waypoint here would jump into or reject the original obstacle.
@@ -8085,7 +8297,7 @@ function Follow.PlanStep(token, hum, root, goal, feetY, state, rescueGoal)
     end
     if Follow.ActiveCrossing(token, hum, root) then return FH.Move(token, hum, Follow.CrossingTraversal.aim) end
     if Follow.ActiveDrop(token, hum, root) then return FH.Move(token, hum, Follow.DropTraversal.aim) end
-    local goalGround, goalHit = FH.Ground(goal)
+    local goalGround, goalHit = Follow.GoalGround(goal, approachModel)
     if stable and goalHit and goalHit.Normal.Y > 0.6 and math.abs(goalGround.Y - 0.5 - feetY) > 1.5 then
         local floorY = goalGround.Y - 0.5
         local connected, jumps = FH.Line(rp, goal, feetY, floorY, 1.5)
@@ -8186,6 +8398,14 @@ function Follow.PlanStep(token, hum, root, goal, feetY, state, rescueGoal)
     if not aim then
         if now < (state.retryAt or 0) then return false end
         local dv = Flat(goal - rp)
+        -- A provisional lane is not a complete route. During rescue, leave
+        -- backward detours to the planner rather than committing away from a
+        -- nearby teammate while its shortest reachable path is still computing.
+        local function useful(point)
+            local delta = Flat(point - rp)
+            return not rescueGoal or dv.Magnitude < 0.1 or delta.Magnitude < 0.1
+                or delta.Unit:Dot(dv.Unit) >= -0.15
+        end
         local reach = math.min(dv.Magnitude, 12)
         if reach > 0.5 then
             local direct = rp + dv.Unit * reach
@@ -8203,7 +8423,7 @@ function Follow.PlanStep(token, hum, root, goal, feetY, state, rescueGoal)
             if picked then
                 local step = Flat(picked - rp)
                 local candidate = step.Magnitude > 12 and rp + step.Unit * 12 or picked
-                if step.Magnitude > 1.25 and not failed(candidate) and clearLane(rp, candidate, feetY) then
+                if step.Magnitude > 1.25 and useful(candidate) and not failed(candidate) and clearLane(rp, candidate, feetY) then
                     aim, state.dir = candidate, dir
                 end
             end
@@ -8222,7 +8442,7 @@ function Follow.PlanStep(token, hum, root, goal, feetY, state, rescueGoal)
                 -forward,
             }) do
                 local candidate = rp + dir * 8
-                if not failed(candidate) and clearLane(rp, candidate, feetY) then
+                if useful(candidate) and not failed(candidate) and clearLane(rp, candidate, feetY) then
                     local score = -Flat(goal - candidate).Magnitude + dir:Dot(forward) * 4
                     for _, visited in ipairs(state.trail) do
                         if (candidate.X - visited.x) ^ 2 + (candidate.Z - visited.z) ^ 2 < 16 then score = score - 4 end
@@ -8244,7 +8464,7 @@ function Follow.PlanStep(token, hum, root, goal, feetY, state, rescueGoal)
     local kind, sill = Follow.RouteProfile(token, hum, root, aim, feetY, 3.4, stable)
     local crossing = stable and Follow.CrossingPlan(token, hum, root, aim, feetY)
     if stable or kind == "jump" or kind == "jump2" then
-        if FH.TryJump(hum, root, aim, feetY, kind, sill) then Follow.CommitCrossing(crossing) end
+        if FH.TryJump(hum, root, aim, feetY, kind, sill, token) then Follow.CommitCrossing(crossing) end
     end
     if rescueGoal then aim = FH.RescueJuke(token, root, aim, rescueGoal, feetY) end
     return FH.Move(token, hum, aim)
@@ -8808,8 +9028,7 @@ function Follow.AirClear(hum, root, point, reachLimit)
 end
 -- Root/trigger heights can differ on the same floor, or nearly match across
 -- two floors. Only a real supporting floor can confirm arrival/contact.
-function Follow.GoalOnFloor(hum, root, goal, ignoreModel)
-    if not (hum and root and goal) then return false end
+function Follow.GoalGround(goal, ignoreModel)
     local params = rayParams
     if ignoreModel then
         FH.ApproachRays = FH.ApproachRays or setmetatable({}, { __mode = "k" })
@@ -8826,7 +9045,11 @@ function Follow.GoalOnFloor(hum, root, goal, ignoreModel)
         end
         params = cached.params
     end
-    local ground, hit = FH.Ground(goal, params)
+    return FH.Ground(goal, params)
+end
+function Follow.GoalOnFloor(hum, root, goal, ignoreModel)
+    if not (hum and root and goal) then return false end
+    local ground, hit = Follow.GoalGround(goal, ignoreModel)
     return hit ~= nil and hit.Normal.Y > 0.6 and math.abs(ground.Y - 0.5 - FH.Feet(hum, root)) <= 1.5
 end
 function Follow.WalkTo(token, getGoal, stopDist, abort, opts)
@@ -9041,7 +9264,7 @@ function Follow.WalkTo(token, getGoal, stopDist, abort, opts)
                     FH.ConfirmNormalTakeoff(hum, root, token)
                 end
             else
-                accepted = FH.Jump(hum, true)
+                accepted = FH.Jump(hum, true, token)
             end
         end
         if accepted then crossingTraversal = Follow.CommitCrossing(crossing) end
@@ -9147,7 +9370,7 @@ function Follow.WalkTo(token, getGoal, stopDist, abort, opts)
                     atlas = { mode = "path", wps = route, full = true, navMeta = meta }
                     -- Rescue may open a shorter closed-door portal. A nearly
                     -- straight verified atlas lane needs no native ComputeAsync.
-                    if not rescue or meta.cost <= straight * 1.12 + 4 then return atlas end
+                    if meta.cost <= straight * (rescue and 1.12 or 1.35) + (rescue and 4 or 8) then return atlas end
                 end
                 -- A scanner proof can disagree with current avatar geometry.
                 -- Try the native planner in this job instead of retrying this
@@ -9176,7 +9399,7 @@ function Follow.WalkTo(token, getGoal, stopDist, abort, opts)
                 path = nil
             end
         end
-        if atlas and (not w or atlas.navMeta.cost <= FH.RouteCost(w, len, true)) then
+        if atlas and (not w or atlas.navMeta.cost <= FH.RouteCost(w, len, rescue)) then
             if path then path:Destroy() end
             return atlas
         end
@@ -9237,7 +9460,7 @@ function Follow.WalkTo(token, getGoal, stopDist, abort, opts)
     local function applyRes(res, rp, goal)
         if not res then return nil end
         if res.mode == "direct" then
-            if stableFollow then
+            if routeProgress then
                 local currentHum, currentRoot = GetHumanoid(), RootNow()
                 if
                     not currentHum
@@ -9327,6 +9550,7 @@ function Follow.WalkTo(token, getGoal, stopDist, abort, opts)
         local feetY = FH.Feet(hum, root)
         local flatDist = Flat(goal - rp).Magnitude
         local dyg = math.abs(goal.Y - rp.Y)
+        if FH.Nav then FH.Nav.CurrentGoal = goal end
         local sd = type(stopDist) == "function" and stopDist() or stopDist
         FH.RefreshFilter()
         FH.Tick(hum, root)
@@ -9448,7 +9672,7 @@ function Follow.WalkTo(token, getGoal, stopDist, abort, opts)
             if stableFollow and j.goal and (goal - j.goal).Magnitude > 5 and j.res then
                 local from = j.res.mode == "direct" and rp or (j.res.mode == "path" and j.res.wps[#j.res.wps].Position)
                 if from then
-                    local groundY = FH.Ground(goal).Y - 0.5
+                    local groundY = Follow.GoalGround(goal, opts.approachModel).Y - 0.5
                     local fromY = j.res.mode == "direct" and feetY or from.Y
                     fresh = (j.res.mode ~= "direct" or dyg < Follow.MaxDY)
                         and FH.Line(from, goal, fromY, groundY, 1.5)
@@ -9490,7 +9714,7 @@ function Follow.WalkTo(token, getGoal, stopDist, abort, opts)
             if mode == "direct" then
                 if now - chkAt > 0.25 then
                     chkAt = now
-                    local ok = FH.Line(rp, goal, feetY, FH.Ground(goal).Y - 0.5, 1.5)
+                    local ok = FH.Line(rp, goal, feetY, Follow.GoalGround(goal, opts.approachModel).Y - 0.5, 1.5)
                     if not ok then need = true end
                 end
             else
@@ -9509,12 +9733,11 @@ function Follow.WalkTo(token, getGoal, stopDist, abort, opts)
             planAt, planGoal = now, goal
             local lineOk, jumps, big = false, 0, 0
             if
-                now > banDirect
-                and now > FH.BanDirect
+                (now > banDirect and now > FH.BanDirect or flatDist < 18)
                 and flatDist < 70
                 and (not stableFollow or dyg < Follow.MaxDY)
             then
-                lineOk, jumps, big = FH.Line(rp, goal, feetY, FH.Ground(goal).Y - 0.5, 1.5)
+                lineOk, jumps, big = FH.Line(rp, goal, feetY, Follow.GoalGround(goal, opts.approachModel).Y - 0.5, 1.5)
             end
             lineOk = lineOk and clearLane(rp, goal, feetY)
             if lineOk and (jumps == 0 or evade or (windows and jumps <= 3 and big <= 1)) then
@@ -9528,7 +9751,7 @@ function Follow.WalkTo(token, getGoal, stopDist, abort, opts)
                 job = j
                 local pre = { lineOk = lineOk, jumps = jumps, big = big, straight = flatDist }
                 local r0, g0, f0 = rp, goal, feetY
-                if not mode then Follow.PlanStep(token, hum, root, goal, feetY, pendingSteer, opts.rescueJuke) end
+                if not mode then Follow.PlanStep(token, hum, root, goal, feetY, pendingSteer, opts.rescueJuke, opts.approachModel) end
                 task.spawn(function()
                     local ok, res = pcall(planner, r0, g0, f0, myGen, pre)
                     if res and (myGen ~= gen or not alive()) then
@@ -9541,7 +9764,7 @@ function Follow.WalkTo(token, getGoal, stopDist, abort, opts)
             end
         end
         if not mode then
-            if not Follow.PlanStep(token, hum, root, goal, feetY, pendingSteer, opts.rescueJuke) then
+            if not Follow.PlanStep(token, hum, root, goal, feetY, pendingSteer, opts.rescueJuke, opts.approachModel) then
                 -- Only stop if every locally scanned direction is obstructed.
                 FH.Move(token, hum, rp, false, goal)
             end
@@ -9655,7 +9878,7 @@ function Follow.WalkTo(token, getGoal, stopDist, abort, opts)
             end
             if blockedAt and wpi >= blockedAt then
                 mode = nil
-                if not Follow.PlanStep(token, hum, root, goal, feetY, pendingSteer, opts.rescueJuke) then
+                if not Follow.PlanStep(token, hum, root, goal, feetY, pendingSteer, opts.rescueJuke, opts.approachModel) then
                     FH.Move(token, hum, rp, false, goal)
                 end
                 task.wait(0.03)
@@ -9686,7 +9909,8 @@ function Follow.WalkTo(token, getGoal, stopDist, abort, opts)
                         local delta = Flat(point - rp)
                         if delta.Magnitude > 0.1 then
                             local perpendicular = Vector3.new(-delta.Unit.Z, 0, delta.Unit.X)
-                            for _, offset in ipairs({ 1.2, -1.2 }) do
+                            local radius = FH.BodyRadius(root)
+                            for _, offset in ipairs({ radius, -radius }) do
                                 for _, height in ipairs({ 1.3, 3 }) do
                                     local origin = Vector3.new(rp.X, feetY + height, rp.Z) + perpendicular * offset
                                     if Workspace:Raycast(origin, delta, rayParams) then return false end
@@ -9715,7 +9939,7 @@ function Follow.WalkTo(token, getGoal, stopDist, abort, opts)
                     banDirect = math.max(banDirect, now + 0.5)
                     reset()
                     nextPlan = 0
-                    if not Follow.PlanStep(token, hum, root, goal, feetY, pendingSteer) then
+                    if not Follow.PlanStep(token, hum, root, goal, feetY, pendingSteer, opts.rescueJuke, opts.approachModel) then
                         FH.Move(token, hum, rp, false, goal)
                     end
                     task.wait(0.03)
@@ -9794,7 +10018,7 @@ function Follow.WalkTo(token, getGoal, stopDist, abort, opts)
             if not flying and (physicalRoute or kind == "jump" or kind == "jump2") then
                 local crossing = physicalRoute
                     and Follow.CrossingPlan(token, hum, root, aim, feetY, mode == "path" and wpi or nil, wps)
-                if FH.TryJump(hum, root, aim, feetY, kind, sill) then
+                if FH.TryJump(hum, root, aim, feetY, kind, sill, token) then
                     crossingTraversal = Follow.CommitCrossing(crossing)
                 end
             end
@@ -9827,20 +10051,20 @@ function Follow.WalkTo(token, getGoal, stopDist, abort, opts)
                     end
                 end
             elseif (kind == "wall" or kind == "door") and mode == "direct" then
-                if stableFollow and not flying then FH.RejectLane(token, hum, aim) end
+                if routeProgress and not flying then FH.RejectLane(token, hum, aim) end
                 banDirect = now + 4
                 reset()
                 continue
             end
         end
-        if stableFollow and not flying and (kind == "wall" or kind == "door") then
+        if routeProgress and not flying and (kind == "wall" or kind == "door") then
             FH.RejectLane(token, hum, aim)
             -- Native paths can become blocked without a Path.Blocked signal.
             -- Reject the collision aim now and keep walking a verified local lane.
             banDirect = math.max(banDirect, now + 1)
             reset()
             nextPlan = 0
-            if not Follow.PlanStep(token, hum, root, goal, feetY, pendingSteer) then
+            if not Follow.PlanStep(token, hum, root, goal, feetY, pendingSteer, opts.rescueJuke, opts.approachModel) then
                 FH.Move(token, hum, rp, false, goal)
             end
             task.wait(0.03)
@@ -9880,12 +10104,16 @@ end
 function FH.PodApproach(trig, rp)
     local params = FH.PodRay(trig)
     local cands = {}
-    for _, rad in ipairs({ 3.0, 5.0 }) do
+    local offset = Flat(rp - trig.Position)
+    local bearing = offset.Magnitude > 0.1 and math.atan2(offset.Z, offset.X) or 0
+    -- Begin on the player's side of the pod. A fixed compass ring can first
+    -- send the player behind it even when the straight approach is open.
+    for _, rad in ipairs({ 4.4, 3.0, 5.0 }) do
         for i = 0, 7 do
-            local a = i * math.pi / 4
+            local a = bearing + i * math.pi / 4
             local p = trig.Position + Vector3.new(math.cos(a) * rad, 0, math.sin(a) * rad)
-            local gp = FH.Ground(p)
-            if math.abs(gp.Y - trig.Position.Y) < 6 then
+            local gp, floor = FH.Ground(p, params)
+            if floor and floor.Normal.Y > 0.6 and math.abs(gp.Y - trig.Position.Y) < 6 then
                 local o = Vector3.new(gp.X, gp.Y + 2, gp.Z)
                 local blocked = Workspace:Raycast(o, trig.Position - o, params)
                 if not blocked and not FH.IsBad(gp.X, gp.Z, 1.5) then
@@ -10009,10 +10237,11 @@ function FH.RescueJuke(tok, root, aim, podGoal, feetY)
 end
 function FH.RescuePod(tok, alive, info, stopFn, hold, release, travel, contactRange)
     local trig, ev = info.trig, info.ev
+    local pod = trig:FindFirstAncestor("FreezePod")
     local closeContact = contactRange ~= nil
     local HR = closeContact and contactRange or Follow.HelpDist + 1.6
-    local holdRange = closeContact and math.min(HR + 0.2, 3) or HR + 0.8
-    local contactHeight = closeContact and 3.5 or 7
+    local holdRange = HR + 0.5
+    local contactHeight = 4.5
     local routeState = { rescueTarget = trig }
     local function holds()
         local t = trig:FindFirstChild("CapturedTorso")
@@ -10026,8 +10255,8 @@ function FH.RescuePod(tok, alive, info, stopFn, hold, release, travel, contactRa
         return r and Flat(trig.Position - r.Position).Magnitude or math.huge
     end
     local function sees()
-        local r = RootNow()
-        if not r then return false end
+        local r, hum = RootNow(), GetHumanoid()
+        if not r or not Follow.GoalOnFloor(hum, r, trig.Position, pod) then return false end
         return Workspace:Raycast(r.Position, trig.Position - r.Position, FH.PodRay(trig)) == nil
     end
     local function near()
@@ -10131,13 +10360,23 @@ function FH.RescuePod(tok, alive, info, stopFn, hold, release, travel, contactRa
         Ctl.Gate()
 
         if not near() then
+            local root = RootNow()
+            local cands = root and FH.PodApproach(trig, root.Position) or {}
+            local approach = cands[1] and cands[1].p or trig.Position
             moving(true)
             Follow.WalkTo(
                 tok,
-                function() return trig.Position end,
-                1.5,
+                function() return approach end,
+                0.8,
                 function() return stop() or near() end,
-                { maxTime = 14, nearOk = 2.5, rescueJuke = trig.Position, rescueSteer = routeState }
+                {
+                    maxTime = 8,
+                    nearOk = 1,
+                    approachModel = pod,
+                    windows = true,
+                    rescueJuke = trig.Position,
+                    rescueSteer = routeState,
+                }
             )
             contactAdvance()
             moving(false)
@@ -10148,10 +10387,20 @@ function FH.RescuePod(tok, alive, info, stopFn, hold, release, travel, contactRa
             if not near() and flatDist() < 22 then
                 attempts = attempts + 1
                 local r = RootNow()
-                local cands = r and FH.PodApproach(trig, r.Position) or {}
+                cands = r and FH.PodApproach(trig, r.Position) or {}
                 local reached, tried = false, 0
+                local triedPoints = { approach }
                 for _, c in ipairs(cands) do
                     if stop() or tried >= 3 then break end
+                    local repeated = false
+                    for _, point in ipairs(triedPoints) do
+                        if Flat(c.p - point).Magnitude < 2.2 then
+                            repeated = true
+                            break
+                        end
+                    end
+                    if repeated then continue end
+                    triedPoints[#triedPoints + 1] = c.p
                     tried = tried + 1
                     -- WalkTo plans in the background while steering; do not wait for
                     -- another ComputeAsync here before starting the approach.
@@ -10159,9 +10408,16 @@ function FH.RescuePod(tok, alive, info, stopFn, hold, release, travel, contactRa
                     Follow.WalkTo(
                         tok,
                         function() return c.p end,
-                        1.4,
+                        0.8,
                         function() return stop() or near() end,
-                        { maxTime = 10, nearOk = 3, rescueJuke = trig.Position, rescueSteer = routeState }
+                        {
+                            maxTime = 4,
+                            nearOk = 1,
+                            approachModel = pod,
+                            windows = true,
+                            rescueJuke = trig.Position,
+                            rescueSteer = routeState,
+                        }
                     )
                     contactAdvance()
                     moving(false)
@@ -10177,7 +10433,7 @@ function FH.RescuePod(tok, alive, info, stopFn, hold, release, travel, contactRa
             end
         end
         if near() and not stop() then
-            local retryAt, lost, contactStopped = os.clock() + 2, nil, false
+            local retryAt, lost, contactStopped = os.clock() + 0.45, nil, false
             while not stop() and os.clock() - t0 < 75 do
                 Follow.Beat = os.clock()
                 if Ctl.Gate() then break end
@@ -10196,7 +10452,11 @@ function FH.RescuePod(tok, alive, info, stopFn, hold, release, travel, contactRa
                         -- game-selected trigger keeps one uninterrupted hold.
                         if now >= retryAt and acknowledged() ~= true then
                             release()
-                            retryAt = now + 2
+                            -- Give InputEnded a frame before the next E press.
+                            -- Keep an acknowledged rescue held without pulses.
+                            task.wait(0.04)
+                            if stop() or not near() then break end
+                            retryAt = os.clock() + 0.45
                         end
                         hold(ev)
                     end
@@ -10463,7 +10723,7 @@ function Follow.Chase(token, getGoal, stopDist, abort, keep)
                 local kind, sill = Follow.RouteProfile(token, hum, root, aimNow, feetY, reach, stable)
                 if stable or kind == "jump" or kind == "jump2" then
                     local crossing = stable and Follow.CrossingPlan(token, hum, root, aimNow, feetY)
-                    if FH.TryJump(hum, root, aimNow, feetY, kind, sill) then Follow.CommitCrossing(crossing) end
+                    if FH.TryJump(hum, root, aimNow, feetY, kind, sill, token) then Follow.CommitCrossing(crossing) end
                 end
                 if kind == "wall" or kind == "door" then
                     if lineOk then
@@ -10514,14 +10774,25 @@ function FH.ExitDoorOpen(door, center, triggers)
     triggers = triggers or (door:IsA("Model") and FH.Triggers(door) or {})
     if not center or #triggers == 0 then return false end
     FH.ExitDoorParams = FH.ExitDoorParams or setmetatable({}, { __mode = "k" })
-    local params = FH.ExitDoorParams[door]
-    if not params then
-        params = RaycastParams.new()
+    local cached, now = FH.ExitDoorParams[door], os.clock()
+    if not cached or now - cached.at >= 0.25 then
+        local params = RaycastParams.new()
         params.FilterType = Enum.RaycastFilterType.Include
-        params.FilterDescendantsInstances = { door }
+        local _, _, area = FH.ExitArea(door)
+        local solids = {}
+        for _, part in ipairs(door:GetDescendants()) do
+            -- Escape volumes and interaction triggers are not gate panels.
+            -- Include the actual parts so a panel's live CanCollide still wins.
+            if part:IsA("BasePart") and part ~= area and not string.find(string.lower(part.Name), "trigger", 1, true) then
+                solids[#solids + 1] = part
+            end
+        end
+        params.FilterDescendantsInstances = solids
         pcall(function() params.RespectCanCollide = true end)
-        FH.ExitDoorParams[door] = params
+        cached = { params = params, at = now }
+        FH.ExitDoorParams[door] = cached
     end
+    local params = cached.params
     local tested = false
     for _, trigger in ipairs(triggers) do
         if trigger.Parent then
@@ -10534,7 +10805,7 @@ function FH.ExitDoorOpen(door, center, triggers)
                 for _, offset in ipairs({ 0, 0.65, -0.65 }) do
                     for _, height in ipairs({ -1, 1 }) do
                         local from = trigger.Position + Vector3.new(0, height, 0) + across * offset
-                        local hit = Workspace:Raycast(from, delta + delta.Unit * 2, params)
+                        local hit = Workspace:Raycast(from, delta, params)
                         if hit and hit.Instance.CanCollide and hit.Normal.Y < 0.6 then return false end
                     end
                 end
@@ -10542,6 +10813,57 @@ function FH.ExitDoorOpen(door, center, triggers)
         end
     end
     return tested
+end
+-- The escape volume may end at the map boundary, beyond the navigation mesh.
+-- Commit only the short, physically clear lane from the exit's room-side trigger.
+function FH.ExitTraversalClear(token, hum, root, point)
+    local crossing = FH.ExitTraversal
+    return crossing ~= nil
+        and crossing.token == token
+        and crossing.hum == hum
+        and crossing.root == root
+        and os.clock() < crossing.untilAt
+        and Flat(point - crossing.aim).Magnitude < 0.2
+        and math.abs(point.Y - crossing.aim.Y) <= 0.2
+        and math.abs(root.Position.Y - crossing.aim.Y) <= Follow.MaxDY
+        and FH.ExitDoorOpen(crossing.door, crossing.center, crossing.triggers)
+        and FH.ApproachClear(root.Position, point, crossing.area)
+end
+function FH.ExitTraverse(token, state, stopped)
+    local root, hum = RootNow(), GetHumanoid()
+    if not (root and hum and state.center) then return false end
+    local aim = Vector3.new(state.center.X, root.Position.Y, state.center.Z)
+    if Flat(aim - root.Position).Magnitude > 18 then return false end
+    local crossing = {
+        token = token,
+        hum = hum,
+        root = root,
+        aim = aim,
+        door = state.door,
+        center = state.center,
+        triggers = state.triggers,
+        area = state.area,
+        untilAt = os.clock() + 3,
+    }
+    FH.ExitTraversal = crossing
+    local anchor, progressedAt = root.Position, os.clock()
+    while not stopped() and os.clock() < crossing.untilAt do
+        if RootNow() ~= root or GetHumanoid() ~= hum or not FH.ExitTraversalClear(token, hum, root, aim) then break end
+        Follow.Beat = os.clock()
+        if Flat(aim - root.Position).Magnitude <= 0.45 then
+            FH.Move(token, hum, root.Position)
+        else
+            FH.Move(token, hum, aim)
+        end
+        if Flat(root.Position - anchor).Magnitude >= 0.3 then
+            anchor, progressedAt = root.Position, os.clock()
+        elseif os.clock() - progressedAt > 0.9 then
+            break
+        end
+        task.wait(0.03)
+    end
+    if FH.ExitTraversal == crossing then FH.ExitTraversal = nil end
+    return FH.True(LocalPlayer, FH.ESC)
 end
 function FH.AnyExitOpen()
     local map = GetCurrentMap()
@@ -10801,12 +11123,11 @@ function FH.ExitRoute(token, state, abort)
                 + outward
                     * math.max(waitRange, state.stand and Flat(state.stand.Position - center).Magnitude or waitRange)
         )
-    local through = FH.Ground(center - outward * 10)
     local open = FH.ExitDoorOpen(door, center, state.triggers)
     local ready = FH.ExitPolicy(center, state.waitPos)
     local directEscape = open and (ready or FH.ExitDanger())
     state.escaping = directEscape or nil
-    local goal = directEscape and through or not open and state.stand and state.stand.Position or state.waitPos
+    local goal = (directEscape or not open) and state.stand and state.stand.Position or state.waitPos
     if Flat(goal - root.Position).Magnitude > 3.5 or math.abs(goal.Y - root.Position.Y) > Follow.MaxDY then
         local travelTime =
             math.clamp((goal - root.Position).Magnitude / math.max(hum.WalkSpeed or 16, 4) * 2 + 8, 8, 45)
@@ -10815,7 +11136,7 @@ function FH.ExitRoute(token, state, abort)
             function() return goal end,
             1.8,
             stopped,
-            { maxTime = travelTime, nearOk = 3, noDoor = directEscape, windows = true }
+            { maxTime = travelTime, nearOk = 3, noDoor = directEscape, windows = true, approachModel = state.area }
         )
         if stopped() then return interrupted() end
         root, hum = RootNow(), GetHumanoid()
@@ -10861,18 +11182,9 @@ function FH.ExitRoute(token, state, abort)
     ready = FH.ExitPolicy(center, state.waitPos)
     if ready or FH.ExitDanger() then
         state.escaping = true
-        Follow.WalkTo(
-            token,
-            function() return through end,
-            1.5,
-            stopped,
-            { maxTime = 8, nearOk = 2.5, noDoor = true, windows = true }
-        )
-        if escaped() then return "escaped" end
+        local crossed = FH.ExitTraverse(token, state, stopped)
         if stopped() then return interrupted() end
-        Follow.Push(token, through, 1, stopped, 1.5)
-        if stopped() then return interrupted() end
-        return escaped() and "escaped" or "retry"
+        return crossed and "escaped" or "retry"
     end
     root, hum = RootNow(), GetHumanoid()
     if root and hum then
@@ -11153,7 +11465,7 @@ function Follow.Main(token, player)
             local ev = trig:FindFirstChild("Event")
             lastChk = 0
             local walkLost = false
-            local res = Follow.WalkTo(token, function() return trig.Position end, 1.0, function()
+            local res = Follow.WalkTo(token, function() return trig.Position end, 2.4, function()
                 if stop() then return true end
                 if lost(trig) then
                     walkLost = true
@@ -11205,9 +11517,18 @@ function Follow.Main(token, player)
                         break
                     end
                     local dist = math.abs(offset.Y) <= 3.6 and Flat(offset).Magnitude or math.huge
-                    if FH.CanHold(st, dist, 1.5, 4.2) then
+                    if not FH.ApproachClear(r2.Position, trig.Position, comp) then
+                        Follow.Release(token)
+                        routeLost = true
+                        break
+                    end
+                    -- Enter interaction range once, then keep its wider contact
+                    -- margin. Driving to the trigger center first causes jitter
+                    -- against the keyboard and an unnecessary one-second delay.
+                    st.on = dist <= (st.on and 4.2 or 3.2)
+                    if st.on then
                         FH.Move(token, hum, r2.Position)
-                        Follow.Hold(ev, Follow.HackSendResult)
+                        Follow.Hold(ev, Follow.HackSendResult, true, false, token)
                         FH.MarkWork(token, "hack")
                         fwPos, fwAt = r2.Position, os.clock()
                     else
@@ -11296,8 +11617,8 @@ function Follow.Main(token, player)
             go,
             info,
             stopFn,
-            function(ev, ro) Follow.Hold(ev, false, not ro, true) end,
-            Follow.Release
+            function(ev, ro) return Follow.Hold(ev, false, not ro, true, token) end,
+            function() return Follow.Release(token) end
         )
         Follow.Rescuing = false
         if not ok then error(res, 0) end
@@ -11984,59 +12305,64 @@ function AH.Steer(rp, bp, bvel, feetY, juke)
     if away.Magnitude < 0.5 then away = Vector3.new(math.random() - 0.5, 0, math.random() - 0.5) end
     away = away.Unit
     local prev = AH.Dir
-    local full = AH.ScanSegs * AH.SegLen
-    local function pass(minDot, closestMin, minRun)
-        local best, bestScore, bestRun, bestDir
-        for i = 0, 11 do
-            local a = i * math.pi / 6
-            local dir = Vector3.new(math.cos(a), 0, math.sin(a))
-            local dot = dir:Dot(away)
-            if dot > minDot then
-                local run, jumps = AH.Scan(rp, dir, feetY)
-                if run >= minRun then
-                    local P = rp + dir * run
-                    local ok = true
-                    if closestMin then
-                        local seg = Flat(P - rp)
-                        local t = math.clamp(Flat(pred - rp):Dot(seg) / math.max(seg:Dot(seg), 1), 0, 1)
-                        local closest = (Flat(rp) + seg * t - Flat(pred)).Magnitude
-                        if closest < closestMin then ok = false end
-                    end
-                    if ok then
-                        local after = Flat(P - pred).Magnitude
-                        local sc = after + run * 0.8 + dot * (closestMin and 4 or 10)
-                        if juke then
-                            sc = sc + jumps * 4
-                        else
-                            sc = sc - jumps * 1.2
-                        end
-                        if run >= full then sc = sc + 8 end
-                        if run < 12 then sc = sc - (12 - run) * 3 end
-                        if prev then sc = sc + math.max(dir:Dot(prev), 0) * 8 end
-                        if not bestScore or sc > bestScore then
-                            bestScore, best, bestRun, bestDir = sc, P, run, dir
-                        end
-                    end
-                end
+    local forward = prev and Flat(prev) or away
+    forward = forward.Magnitude > 0.1 and forward.Unit or away
+    local side = Vector3.new(-forward.Z, 0, forward.X)
+    local full, current = AH.ScanSegs * AH.SegLen, Flat(rp - pred).Magnitude
+    local headings, candidates = { forward }, {}
+    -- Exact travel and threat bearings survive rotation of the map. Scan each
+    -- direction once; the old three passes repeated the same expensive rays.
+    if forward:Dot(away) < 0.995 then headings[#headings + 1] = away end
+    for _, angle in ipairs({ 30, -30, 60, -60, 90, -90, 120, -120, 150, -150, 180 }) do
+        local rad = math.rad(angle)
+        headings[#headings + 1] = forward * math.cos(rad) + side * math.sin(rad)
+    end
+    for _, dir in ipairs(headings) do
+        local run, jumps, _, endY = AH.Scan(rp, dir, feetY)
+        if run >= AH.SegLen then
+            local raw = rp + dir * run
+            local point = Vector3.new(raw.X, (endY or feetY) + rp.Y - feetY, raw.Z)
+            local step = Flat(point - rp)
+            local t = math.clamp(Flat(pred - rp):Dot(step) / step:Dot(step), 0, 1)
+            local closest = Flat(rp + step * t - pred).Magnitude
+            local liveT = math.clamp(Flat(bp - rp):Dot(step) / step:Dot(step), 0, 1)
+            local liveClosest = Flat(rp + step * liveT - bp).Magnitude
+            -- Even the fallback must not cross through the approaching Beast.
+            if closest >= math.min(8, math.max(0, current - 0.5))
+                and liveClosest >= math.min(8, math.max(0, Flat(rp - bp).Magnitude - 0.5))
+            then
+                local score = Flat(point - pred).Magnitude + run * 0.8 + dir:Dot(away) * 10
+                    + jumps * (juke and 4 or -1.2)
+                    + (run >= full and 8 or 0)
+                    + math.max(dir:Dot(forward), 0) * 6
+                candidates[#candidates + 1] = { point = point, run = run, dir = dir, score = score }
             end
         end
-        return best, bestRun, bestDir
     end
-
-    local best, bestRun, bestDir = pass(juke and -0.1 or -0.3, nil, 4)
-    if not best or bestRun < 10 then
-        local b2, r2, d2 = pass(-0.95, 8, 4)
-        if b2 and (not best or r2 > bestRun) then
-            best, bestRun, bestDir = b2, r2, d2
+    table.sort(candidates, function(a, b) return a.score > b.score end)
+    -- Center rays can see past a frame while the shoulders hit it. Only the
+    -- few best headings pay for full body-width support/obstacle checks.
+    for i = 1, math.min(3, #candidates) do
+        local pick = candidates[i]
+        if AH.LaneClear(rp, pick.point, feetY) then
+            AH.Dir = pick.dir
+            -- A clear 4–8 stud turn is useful movement, not a dead end that
+            -- should enter a multi-second door/path recovery routine.
+            return pick.point, pick.run, false
+        end
+        if pick.run > 8 then
+            -- A shoulder obstruction farther down a long ray must not throw
+            -- away the safe nearby section before we can reach its turn.
+            local short = rp + pick.dir * 8
+            local clear, endY = AH.LaneClear(rp, short, feetY)
+            if clear then
+                AH.Dir = pick.dir
+                short = Vector3.new(short.X, (endY or feetY) + rp.Y - feetY, short.Z)
+                return short, 8, false
+            end
         end
     end
-    if not best then
-        best, bestRun, bestDir = pass(-1.01, nil, 2)
-    end
-
-    if not best then return nil, 0, true end
-    AH.Dir = bestDir
-    return best, bestRun, bestRun < 10
+    return nil, 0, true
 end
 
 -- Prefer a nearby clear window before ordinary evasion. Each burst keeps one
@@ -12053,6 +12379,7 @@ function AH.LaneClear(rp, point, feetY)
     local side = Vector3.new(-dir.Z, 0, dir.X)
     local steps = math.max(1, math.ceil(delta.Magnitude / 3))
     local length = delta.Magnitude / steps
+    local centerY
     for _, offset in ipairs({ 0, radius, -radius }) do
         local origin, floorY = rp + side * offset, feetY
         for i = 0, steps - 1 do
@@ -12061,8 +12388,9 @@ function AH.LaneClear(rp, point, feetY)
             if not nextY or jump and (sill or 0) > maxHeight then return false end
             floorY = nextY
         end
+        if offset == 0 then centerY = floorY end
     end
-    return true
+    return true, centerY
 end
 function AH.VaultSill(rp, dir, feetY, reach, low)
     if not low or FH.DoorOf(low.Instance) then return nil end
@@ -12145,6 +12473,10 @@ function AH.VaultAim(rp, bp, bvel, feetY, state, forward, danger)
         -60 * preferred,
         90 * preferred,
         -90 * preferred,
+        45 * preferred,
+        -45 * preferred,
+        75 * preferred,
+        -75 * preferred,
         30 * preferred,
         -30 * preferred,
     }) do
@@ -12332,27 +12664,44 @@ function AH.OpenDoorAim(rp, bp, feetY, state, forward, danger)
     if forward.Magnitude < 0.1 then forward = away end
     forward = forward.Unit
     local minClosest = math.min(8, math.max(0, away.Magnitude - 0.5))
-    local function safe(point)
-        local step = Flat(point - rp)
-        if step.Magnitude < 1.2 then return false end
-        local t = math.clamp(Flat(bp - rp):Dot(step) / step:Dot(step), 0, 1)
-        return Flat(rp + step * t - bp).Magnitude >= minClosest and AH.LaneClear(rp, point, feetY)
+    local function safe(from, point)
+        local step = Flat(point - from)
+        local t = math.clamp(Flat(bp - from):Dot(step) / math.max(step:Dot(step), 0.01), 0, 1)
+        return Flat(from + step * t - bp).Magnitude >= minClosest and AH.LaneClear(from, point, feetY)
+    end
+    local function target(lane)
+        local g = lane.door
+        local side = Vector3.new(-g.Dir.Z, 0, g.Dir.X)
+        local size = g.Size
+        local halfWidth = size and (math.abs(side.X) * size.X + math.abs(side.Z) * size.Z) * 0.5 or 1.5
+        local radius = FH.BodyRadius and FH.BodyRadius() or 1.1
+        local centered = math.abs(side:Dot(Flat(rp - g.Center))) <= math.max(0.25, halfWidth - radius)
+        if not lane.crossing and (
+            Flat(lane.entry - rp).Magnitude <= 1.8
+            or centered and g.Dir:Dot(Flat(rp - g.Center)) >= -0.5
+        ) then
+            lane.crossing = true
+            state.checkAt = 0
+        end
+        return lane.crossing and lane.point or lane.entry
     end
     local lane = state.lane
     if lane and now < (state.untilAt or 0) and Flat(lane.point - rp).Magnitude > 1.5 then
+        local point = target(lane)
         if now >= (state.checkAt or 0) then
-            state.checkAt = now + 0.2
-            if FH.DoorBlocked(lane.door) or not safe(lane.point) then
-                state.lane = nil
+            state.checkAt = now + 0.12
+            if FH.DoorBlocked(lane.door) or not safe(rp, point) then
+                state.lane, state.nextAt = nil, now + 0.15
                 return nil
             end
         end
-        AH.Dir = Flat(lane.point - rp).Unit
-        return lane.point
+        local heading = Flat(point - rp)
+        if heading.Magnitude > 0.1 then AH.Dir = heading.Unit end
+        return point
     end
     state.lane = nil
     if now < (state.nextAt or 0) then return nil end
-    state.nextAt = now + 0.5
+    state.nextAt = now + 0.2
     local candidates = {}
     for _, door in ipairs(Doors) do
         if IsInWorld(door) and FH.DoorInfo(door) then
@@ -12360,12 +12709,17 @@ function AH.OpenDoorAim(rp, bp, feetY, state, forward, danger)
             if g and FH.DoorOnFloor(g, rp, feetY) and not FH.DoorBlocked(g) then
                 local toward = Flat(g.Center - rp)
                 local distance = Flat(g.NearPos - rp).Magnitude
-                if distance <= 14 and toward.Magnitude > 0.5 and math.abs(toward.Unit:Dot(forward)) < 0.94 then
-                    local after = Flat(g.FarPos - bp).Magnitude
+                if distance <= 16 and toward.Magnitude > 0.5 then
+                    local entry = g.Center - g.Dir * 3.5
+                    local across = g.Center + g.Dir * 3.5
+                    entry = Vector3.new(entry.X, rp.Y, entry.Z)
+                    across = Vector3.new(across.X, rp.Y, across.Z)
+                    local after = Flat(across - bp).Magnitude
                     if after >= away.Magnitude - 0.5 then
                         candidates[#candidates + 1] = {
                             door = g,
-                            point = g.FarPos,
+                            entry = entry,
+                            point = across,
                             score = after - distance * 0.7 + (1 - math.abs(toward.Unit:Dot(forward))) * 4,
                         }
                     end
@@ -12376,11 +12730,16 @@ function AH.OpenDoorAim(rp, bp, feetY, state, forward, danger)
     table.sort(candidates, function(a, b) return a.score > b.score end)
     for i = 1, math.min(2, #candidates) do
         lane = candidates[i]
-        if safe(lane.point) then
-            state.lane, state.untilAt, state.checkAt = lane, now + 1.2, now + 0.2
-            state.nextAt = now + 1.7
-            AH.Dir = Flat(lane.point - rp).Unit
-            return lane.point
+        local point = target(lane)
+        if safe(rp, point) and (lane.crossing or safe(lane.entry, lane.point)) then
+            local hum = GetHumanoid()
+            local speed = hum and math.max(hum.WalkSpeed, 1) or 16
+            local length = Flat(point - rp).Magnitude + (lane.crossing and 0 or Flat(lane.point - lane.entry).Magnitude)
+            state.lane, state.untilAt, state.checkAt = lane, now + math.clamp(length / speed + 0.5, 0.8, 2), now + 0.12
+            state.nextAt = state.untilAt + 0.2
+            local heading = Flat(point - rp)
+            if heading.Magnitude > 0.1 then AH.Dir = heading.Unit end
+            return point
         end
     end
     return nil
@@ -12743,7 +13102,7 @@ function AH.DropAim(token, hum, root, bp, bvel, feetY, forward, danger)
         and not FH.Jmp
     for i = 1, math.min(3, #candidates) do
         lane = AH.DropLane(hum, root, candidates[i].point, feetY)
-        if lane and (lane.sill == 0 or canJump and FH.Jump(hum, lane.double)) then
+        if lane and (lane.sill == 0 or canJump and FH.Jump(hum, lane.double, token)) then
             lane.token, lane.hum, lane.root = token, hum, root
             lane.untilAt = now + 4
             lane.jumpRequested = lane.sill > 0
@@ -12758,7 +13117,7 @@ function AH.DropAim(token, hum, root, bp, bvel, feetY, forward, danger)
 end
 function AH.Go(tok)
     local safeSince
-    local aim, lastSteer, trapN, every = nil, 0, 0, 0.25
+    local aim, lastSteer, trapN, every = nil, 0, 0, 0.15
     local lastPos, lastChk, stuckN = nil, os.clock(), 0
     local trapForward, deadEndState = nil, {}
     local jukeState, vaultState, doorState, wasJuking = {}, {}, {}, false
@@ -12783,11 +13142,24 @@ function AH.Go(tok)
         local feetY = FH.Feet(hum, root)
         FH.RefreshFilter()
         FH.Tick(hum, root)
-        local drop = AH.DropAim(tok, hum, root, e.pos, e.vel, feetY, AH.Dir, e.danger)
-        local vault = not drop and AH.VaultAim(rp, e.pos, e.vel, feetY, vaultState, AH.Dir, e.danger) or nil
-        local door = not (drop or vault) and AH.OpenDoorAim(rp, e.pos, feetY, doorState, AH.Dir, e.danger) or nil
-        local burst = not (drop or vault or door) and AH.JukeAim(rp, e.pos, e.vel, feetY, jukeState, AH.Dir, e.danger)
-            or nil
+        -- Finish a verified opening/drop before another feature picks a new
+        -- heading. Re-running all probes in priority order used to switch away
+        -- from a doorway/window halfway through its crossing.
+        local drop = AH.ActiveDrop(tok, hum, root)
+            and AH.DropAim(tok, hum, root, e.pos, e.vel, feetY, AH.Dir, e.danger) or nil
+        local vault = not drop and vaultState.lane
+            and AH.VaultAim(rp, e.pos, e.vel, feetY, vaultState, AH.Dir, e.danger) or nil
+        local door = not (drop or vault) and doorState.lane
+            and AH.OpenDoorAim(rp, e.pos, feetY, doorState, AH.Dir, e.danger) or nil
+        local burst = not (drop or vault or door) and jukeState.aim
+            and AH.JukeAim(rp, e.pos, e.vel, feetY, jukeState, AH.Dir, e.danger) or nil
+        if not (drop or vault or door or burst) then
+            drop = AH.DropAim(tok, hum, root, e.pos, e.vel, feetY, AH.Dir, e.danger)
+            vault = not drop and AH.VaultAim(rp, e.pos, e.vel, feetY, vaultState, AH.Dir, e.danger) or nil
+            door = not (drop or vault) and AH.OpenDoorAim(rp, e.pos, feetY, doorState, AH.Dir, e.danger) or nil
+            burst = not (drop or vault or door)
+                and AH.JukeAim(rp, e.pos, e.vel, feetY, jukeState, AH.Dir, e.danger) or nil
+        end
         local endedBurst = wasJuking and not (drop or vault or door or burst)
         wasJuking = drop ~= nil or vault ~= nil or door ~= nil or burst ~= nil
         if drop or vault or door or burst then
@@ -12795,7 +13167,7 @@ function AH.Go(tok)
         elseif e.pos and (endedBurst or not aim or now - lastSteer > every or Flat(aim - rp).Magnitude < 3) then
             local previousDir = AH.Dir
             lastSteer = now
-            every = 0.3
+            every = 0.15
             local a, _, trapped = AH.Steer(rp, e.pos, e.vel, feetY, false)
             if a then aim = a end
             if trapped then
@@ -12816,10 +13188,10 @@ function AH.Go(tok)
                         AH.CornerAim(liveRoot.Position, AH.Eval().pos, FH.Feet(liveHum, liveRoot), trapForward)
                     if point then
                         aim, lastSteer = point, os.clock()
-                        if kind == "jump" or kind == "jump2" then
-                            FH.TryJump(liveHum, liveRoot, point, nil, kind, sill)
+                        local moving = FH.Move(tok, liveHum, point)
+                        if moving and FH.Motion and FH.Motion.token == tok and (kind == "jump" or kind == "jump2") then
+                            FH.TryJump(liveHum, liveRoot, point, nil, kind, sill, tok)
                         end
-                        FH.Move(tok, liveHum, point)
                     else
                         AH.PathEscape(tok)
                     end
@@ -12828,6 +13200,7 @@ function AH.Go(tok)
             lastPos, lastChk, stuckN = nil, os.clock(), 0
         elseif aim then
             local dv = Flat(aim - rp)
+            local jumpKind, jumpSill
             if dv.Magnitude > 0.5 then
                 local dir = dv.Unit
                 local flight = FH.JumpFlight
@@ -12836,24 +13209,37 @@ function AH.Go(tok)
                 if not crossing then
                     local kind, sill = FH.Profile(rp.X, rp.Z, dir, feetY, 3.4)
                     if kind == "jump" or kind == "jump2" then
-                        FH.TryJump(hum, root, aim, feetY, kind, sill)
+                        jumpKind, jumpSill = kind, sill
                     elseif kind == "wall" or kind == "door" then
                         jukeState.aim, jukeState.untilAt = nil, 0
                         vaultState.lane, vaultState.untilAt, vaultState.nextAt = nil, 0, now + 0.2
                         doorState.lane = nil
-                        aim, lastSteer = nil, 0
+                        -- Issue the replacement direction in this same tick;
+                        -- clearing aim alone leaves the old wall-facing order.
+                        aim, lastSteer = nil, now
+                        if e.pos then
+                            local replacement, _, trapped = AH.Steer(rp, e.pos, e.vel, feetY, false)
+                            aim = replacement
+                            if trapped then trapN, trapForward = 1, dir end
+                        end
                     end
                 end
             end
             if aim then
                 local moving = FH.Move(tok, hum, aim)
+                -- Space belongs to the accepted evade lease. A first vault
+                -- before Move otherwise keeps the preempted Follow token and
+                -- loses its second Space when the per-frame jump tick runs.
+                if moving and jumpKind and FH.Motion and FH.Motion.token == tok then
+                    FH.TryJump(hum, root, aim, feetY, jumpKind, jumpSill, tok)
+                end
                 local lane = AH.DropTraversal
                 if moving and drop and lane and lane.jumpRequested and not lane.confirmed then
                     lane.confirmed = true
                     FH.ConfirmNormalTakeoff(hum, root, tok)
                 end
             end
-            if not drop and now - lastChk >= 0.25 then
+            if not drop and hum.FloorMaterial ~= Enum.Material.Air and now - lastChk >= 0.25 then
                 local moved = lastPos and Flat(rp - lastPos).Magnitude or 99
                 lastPos, lastChk = rp, now
                 if moved < 0.7 then
@@ -12870,10 +13256,10 @@ function AH.Go(tok)
                         local point, kind, sill = AH.CornerAim(rp, e.pos, feetY, dv.Magnitude > 0.5 and dv.Unit or nil)
                         if point then
                             aim, lastSteer = point, now
-                            if kind == "jump" or kind == "jump2" then
-                                FH.TryJump(hum, root, point, feetY, kind, sill)
+                            local moving = FH.Move(tok, hum, point)
+                            if moving and FH.Motion and FH.Motion.token == tok and (kind == "jump" or kind == "jump2") then
+                                FH.TryJump(hum, root, point, feetY, kind, sill, tok)
                             end
-                            FH.Move(tok, hum, point)
                         else
                             trapN, trapForward = 1, dv.Magnitude > 0.5 and dv.Unit or nil
                         end
@@ -13071,16 +13457,21 @@ function AR.Hold(ev, remoteOnly, token)
     if AH.ReleaseTap then AH.ReleaseTap() end
     if TR.Held or TR.KeyDown then TR.Release() end
     if Follow.Held or Follow.KeyDown then Follow.Release() end
-    if AR.HoldToken ~= token and (AR.Held or AR.KeyDown) then AR.Release() end
+    if
+        (AR.HoldToken ~= token or (ev ~= nil and AR.Held ~= nil and AR.Held ~= ev))
+        and (AR.Held or AR.KeyDown)
+    then
+        AR.Release()
+    end
     AR.HoldToken = token
     local now = os.clock()
     if ev and RemoteEvent and (now - AR.InAt > 0.06 or AR.Held ~= ev) then
         AR.InAt = now
-        pcall(function()
+        local sent = pcall(function()
             RemoteEvent:FireServer("Input", "Trigger", true, ev)
             RemoteEvent:FireServer("Input", "Action", true)
         end)
-        AR.Held = ev
+        if sent then AR.Held = ev end
     end
     if not remoteOnly and not AR.KeyDown and not UserInputService:GetFocusedTextBox() then
         -- Do not claim or later release a physical E hold belonging to the player.
@@ -13100,12 +13491,13 @@ function AR.Hold(ev, remoteOnly, token)
         end
         AR.KeyDown = pressed
     end
-    return AR.KeyDown == true or (remoteOnly == true and AR.Held ~= nil)
+    -- Silent Help remains usable when an executor has no keyboard backend.
+    return AR.KeyDown == true or AR.Held ~= nil
 end
 function AR.Release(token)
-    Speed.ClearRescue(token)
     -- Cancellation cleanup may run after token.ok() became false; ownership suffices.
     if token ~= nil and AR.HoldToken ~= token then return false end
+    Speed.ClearRescue(token)
     local h, kd, keyUp, vim = AR.Held, AR.KeyDown, AR.ERelease, AR.EVim
     AR.Held, AR.KeyDown, AR.InAt, AR.HoldToken = nil, false, 0, nil
     AR.ERelease, AR.EVim = nil, nil
@@ -13221,7 +13613,7 @@ function AR.Pending()
     return AR.PendingPick ~= nil
 end
 function AR.Nearest()
-    local mr = RootNow()
+    local mr, hum = RootNow(), GetHumanoid()
     if not mr then return nil end
     local pods = AR.Pods()
     if #pods == 0 then pods = AR.Pods(true) end
@@ -13237,9 +13629,12 @@ function AR.Nearest()
     local list = {}
     for _, info in ipairs(pods) do
         local straight = (info.trig.Position - mr.Position).Magnitude
+        local pod = info.trig:FindFirstAncestor("FreezePod")
+        local direct = Follow.GoalOnFloor(hum, mr, info.trig.Position, pod)
+            and FH.ApproachClear(mr.Position, info.trig.Position, pod)
         -- Rescue urgency is independent of the escape warning. Euclidean
         -- distance is the lower bound; measured feasible routes refine it.
-        list[#list + 1] = { info = info, straight = straight }
+        list[#list + 1] = { info = info, straight = straight, direct = direct, pod = pod }
     end
     table.sort(list, function(a, b) return a.straight < b.straight end)
     local now, from = os.clock(), mr.Position
@@ -13249,11 +13644,11 @@ function AR.Nearest()
         local e = list[i]
         local cached = AR.PodRoutes[e.info.trig]
         local fresh = cached
-            and now - cached.at < 10
-            and (from - cached.from).Magnitude < 12
+            and now - cached.at < (cached.failed and 2 or 5)
+            and (from - cached.from).Magnitude < 6
             and (cached.occupant == nil or cached.occupant == e.info.occupant)
             and (cached.map == nil or cached.map == GetCurrentMap())
-        local L = fresh and math.max(e.straight, cached.length) or e.straight
+        local L = e.direct and e.straight or (fresh and math.max(e.straight, cached.length) or e.straight)
         if not bl or L < bl then
             best, bl = e.info, L
         end
@@ -13283,51 +13678,67 @@ function AR.Nearest()
                         local function routeValid()
                             return valid() and e.info.trig.Parent ~= nil and torso.Value == occupant
                         end
-                        local wps, len, path, cost, routeAux
+                        if e.direct then
+                            AR.PodRoutes[e.info.trig] = {
+                                from = from,
+                                at = os.clock(),
+                                length = e.straight,
+                                occupant = occupant,
+                                map = GetCurrentMap(),
+                            }
+                            continue
+                        end
+                        local wps, len, path, routeAux
                         local nav, map = FH.Nav, GetCurrentMap()
+                        local cands = FH.PodApproach(e.info.trig, from)
+                        local goal = cands[1] and cands[1].p or e.info.trig.Position
                         if nav and nav.Map == map and nav.Route then
                             local start = FH.Ground(from)
-                            local goal = FH.Ground(e.info.trig.Position)
                             local meta
                             wps, len, routeAux, meta = nav.Route(start, goal, start.Y - 0.5, routeValid, {
                                 allowDoors = true,
-                                approachModel = e.info.trig:FindFirstAncestor("FreezePod"),
+                                approachModel = e.pod,
                                 rescue = true,
                                 liveLanes = true,
                                 budget = 0.2,
                                 maxNodes = 2048,
                                 maxAnchors = 4,
                             })
-                            if
+                            if not (
                                 meta
                                 and meta.complete
                                 and meta.map == map
                                 and meta.generation == nav.Generation
                                 and meta.version == nav.Version
-                            then
-                                cost = meta.cost
-                            else
+                            ) then
                                 wps, len = nil, nil
                             end
                         end
                         if not wps and routeValid() then
                             wps, len, routeAux, path =
-                                FH.PathAny(from, e.info.trig.Position, 1, false, routeValid, nil, true, true)
-                            if wps then cost = FH.RouteCost(wps, len, true) end
+                                FH.PathAny(from, goal, 1, false, routeValid, nil, true, true)
+                            -- One side can lie in a narrow alcove. Test other
+                            -- supported interaction sides before marking a failure.
+                            for side = 2, math.min(3, #cands) do
+                                if wps or not routeValid() then break end
+                                if path then path:Destroy() end
+                                wps, len, routeAux, path =
+                                    FH.PathAny(from, cands[side].p, 1, false, routeValid, nil, true, true)
+                            end
                         end
                         if path then path:Destroy() end
                         if routeValid() then
-                            -- No route result is unknown while the map is being
-                            -- scanned; it is not an invented detour cost.
-                            AR.PodRoutes[e.info.trig] = len
-                                    and {
-                                        from = from,
-                                        at = os.clock(),
-                                        length = cost or len,
-                                        occupant = occupant,
-                                        map = map,
-                                    }
-                                or nil
+                            AR.PodRoutes[e.info.trig] = {
+                                from = from,
+                                at = os.clock(),
+                                length = len or math.huge,
+                                failed = len == nil,
+                                occupant = occupant,
+                                map = map,
+                            }
+                            -- Consume a newly measured route on the next pick,
+                            -- instead of keeping the old Euclidean choice cached.
+                            AR.PickAt = 0
                         end
                     end
                 end
@@ -13353,7 +13764,7 @@ function AR.Rescue(tok, info, alive)
                 Speed.ClearRescue(tok)
             end
         end,
-        2.5 -- AutoHelp starts the interaction only after reaching the pod.
+        Follow.HelpDist + 1.6 -- Reach the pod's interaction side, outside its collision shell.
     )
     FH.ReleaseMotion(tok, false)
     if res == "far" then
