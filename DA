@@ -227,6 +227,8 @@ function Ctl.IsSelf(key)
         return Follow.KeyDown or AR.KeyDown or TR.KeyDown or AH.TapDown or now < Ctl.EUntil
     elseif key == Enum.KeyCode.Space then
         return now < Ctl.SpaceUntil
+    elseif key == Enum.KeyCode.W then
+        return now < (Ctl.ForwardUntil or 0)
     end
     return false
 end
@@ -2596,6 +2598,51 @@ function FH.IsHacking(token)
     local trigger = target.Name:sub(1, 15) == "ComputerTrigger" and target or target.Parent
     return trigger ~= nil and trigger.Name:sub(1, 15) == "ComputerTrigger"
 end
+-- The final, visible computer approach is an interaction, not an obstacle to
+-- jump over. Recheck room/floor geometry on a short cache, never ignore walls.
+function FH.ComputerContactApproach(token, hum, root, goal)
+    local contact, now = Follow.ComputerApproach, os.clock()
+    if
+        not contact
+        or contact.token ~= token
+        or contact.hum ~= hum
+        or contact.root ~= root
+        or now >= contact.untilAt
+        or not hum
+        or not root
+        or hum.Parent ~= LocalPlayer.Character
+        or hum.RootPart ~= root
+        or hum.Health <= 0
+        or not contact.comp.Parent
+        or not contact.trig.Parent
+        or not contact.trig:IsDescendantOf(contact.comp)
+        or Flat(contact.trig.Position - root.Position).Magnitude > 6
+        or math.abs(contact.trig.Position.Y - root.Position.Y) > 3.6
+        or (goal and Flat(goal - contact.trig.Position).Magnitude > 1.5)
+    then
+        return false
+    end
+    local proof = contact.proof
+    if
+        not proof
+        or now - proof.at >= 0.12
+        or proof.filterAt ~= rayFilterAt
+        or (root.Position - proof.pos).Magnitude > 0.25
+        or (contact.trig.Position - proof.goal).Magnitude > 0.1
+    then
+        FH.RefreshFilter()
+        proof = {
+            at = now,
+            filterAt = rayFilterAt,
+            pos = root.Position,
+            goal = contact.trig.Position,
+            clear = Follow.GoalOnFloor(hum, root, contact.trig.Position, contact.comp)
+                and FH.ApproachClear(root.Position, contact.trig.Position, contact.comp),
+        }
+        contact.proof = proof
+    end
+    return proof.clear == true
+end
 -- Shared render callback samples at most ten times per second, with no raycasts.
 -- One grounded jump belongs to each stationary period; only real progress rearms it.
 function FH.StallJumpStep()
@@ -2605,6 +2652,10 @@ function FH.StallJumpStep()
     if now < (FH.StallCheckAt or 0) then return false end
     FH.StallCheckAt = now + 0.1
     local token, hum, root = state.token, state.hum, state.root
+    if FH.ComputerContactApproach(token, hum, root, state.goal) then
+        FH.StallIntent = nil
+        return false
+    end
     if
         unloaded
         or now - state.seen > 1.2
@@ -2691,6 +2742,10 @@ function FH.RecoveryAim(token, hum, goal, intentGoal)
         return goal
     end
     local rp, now = root.Position, os.clock()
+    if FH.ComputerContactApproach(token, hum, root, desired) then
+        FH.MoveWatch = nil
+        return goal
+    end
     if
         (Follow.ActiveDrop and Follow.ActiveDrop(token, hum, root) and Follow.AirClear(hum, root, goal))
         or (AH.ActiveDrop and AH.ActiveDrop(token, hum, root) and AH.DropClear(token, hum, root, goal))
@@ -2983,6 +3038,7 @@ function FH.Move(token, hum, goal, force, intentGoal)
     return true
 end
 function FH.ReleaseMotion(token, stop)
+    if FH.ForwardPulse and FH.ForwardPulse.token == token then FH.ReleaseForward() end
     if FH.StallIntent and FH.StallIntent.token == token then FH.StallIntent = nil end
     if FH.BlockedIntent and FH.BlockedIntent.token == token then FH.BlockedIntent = nil end
     if FH.NormalConfirm and FH.NormalConfirm.token == token then FH.NormalConfirm = nil end
@@ -3002,6 +3058,11 @@ function FH.ReleaseMotion(token, stop)
     return true
 end
 function FH.CancelMotion(owner)
+    local pulse = FH.ForwardPulse
+    if pulse then
+        local name = type(pulse.token) == "table" and (pulse.token.owner or "command") or "follow"
+        if owner == nil or owner == name then FH.ReleaseForward(pulse) end
+    end
     local blocked = FH.BlockedIntent
     if blocked then
         local name = type(blocked.token) == "table" and (blocked.token.owner or "command") or "follow"
@@ -4140,6 +4201,7 @@ function FH.StairJumpStep()
     if not motion or motion.token == nil or not motion.aim then return false end
     local now = os.clock()
     local hum, root = GetHumanoid(), RootNow()
+    if FH.ComputerContactApproach(motion.token, hum, root, motion.aim) then return false end
     if
         unloaded
         or not hum
@@ -4303,6 +4365,173 @@ function FH.PeriodicSpaceStep()
     -- still reasserts the leased direction in this frame, with native speed.
     return FH.NormalJump(hum)
 end
+function FH.ReleaseForward(pulse)
+    pulse = pulse or FH.ForwardPulse
+    if not pulse or FH.ForwardPulse ~= pulse then return false end
+    FH.ForwardPulse = nil
+    Ctl.ForwardUntil = os.clock() + 0.12
+    if pulse.release then
+        return pcall(pulse.release, 0x57)
+    elseif pulse.vim then
+        return pcall(function() pulse.vim:SendKeyEvent(false, Enum.KeyCode.W, false, game) end)
+    end
+    return false
+end
+function FH.ForwardOwner(token)
+    return type(token) == "number" and token == Follow.Token and (Follow.Target ~= nil or Follow.AutoFarm)
+        or type(token) == "table" and token.owner == "rescue" and not token.userRequest and AR.Active
+end
+function FH.PressForward(token, hum, root)
+    if FH.ForwardPulse or not FH.ForwardOwner(token) or not FH.MotionAvailable(token) then return false end
+    local heldOK, held = pcall(function() return UserInputService:IsKeyDown(Enum.KeyCode.W) end)
+    if (heldOK and held) or UserInputService:GetFocusedTextBox() or Ctl.On() then return false end
+    local camera = Workspace.CurrentCamera
+    local frame = camera and camera.CFrame or root.CFrame
+    local forward = frame and Flat(frame.LookVector)
+    if not forward or forward.Magnitude < 0.1 then return false end
+    forward = forward.Unit
+    local safe, kind = FH.TraversalLane(token, hum, root, root.Position + forward * 2, FH.Feet(hum, root), 2, true)
+    if not safe or kind == "jump" or kind == "jump2" then return false end
+    local pulse = { token = token, hum = hum, root = root, character = LocalPlayer.Character }
+    FH.ForwardPulse = pulse
+    Ctl.ForwardUntil = os.clock() + 0.25
+    local pressed = false
+    if type(keypress) == "function" and type(keyrelease) == "function" then
+        pressed = pcall(keypress, 0x57)
+        if pressed then pulse.release = keyrelease end
+    end
+    if not pressed and VIM then
+        pressed = pcall(function() VIM:SendKeyEvent(true, Enum.KeyCode.W, false, game) end)
+        if pressed then pulse.vim = VIM end
+    end
+    if not pressed then
+        FH.ForwardPulse = nil
+        Ctl.ForwardUntil = 0
+        return false
+    end
+    task.delay(0.08, function() FH.ReleaseForward(pulse) end)
+    -- Restart only a currently proved route leg. A key-up never stops MoveTo,
+    -- and this pulse neither renews a lease nor changes movement properties.
+    local motion = FH.Motion
+    if motion.token == token and motion.hum == hum and motion.aim then
+        local ok, lane, action = pcall(FH.TraversalLane, token, hum, root, motion.aim, FH.Feet(hum, root), 3, true)
+        if ok and lane and action ~= "jump" and action ~= "jump2" then pcall(function() hum:MoveTo(motion.aim) end) end
+    end
+    return true
+end
+-- Only unfinished Follow/Farm/Help movement is watched. Intentional work and
+-- nearby computers reset the timer, so a skipped W is never queued for later.
+function FH.ForwardWatchStep()
+    local now, pulse = os.clock(), FH.ForwardPulse
+    if
+        pulse
+        and (
+            unloaded
+            or pulse.character ~= LocalPlayer.Character
+            or not FH.ForwardOwner(pulse.token)
+            or not FH.MotionAvailable(pulse.token)
+        )
+    then
+        FH.ReleaseForward(pulse)
+    end
+    if now < (FH.ForwardCheckAt or 0) then return false end
+    FH.ForwardCheckAt = now + 0.2
+    local hum, root, motion = GetHumanoid(), RootNow(), FH.Motion
+    local token, goal = motion.token, motion.aim
+    local intent = FH.StallIntent
+    if
+        (
+            not FH.ForwardOwner(token)
+            or motion.hum ~= hum
+            or not goal
+            or (root and Flat(goal - root.Position).Magnitude <= 0.5)
+        )
+        and intent
+        and intent.hum == hum
+        and intent.root == root
+        and now - intent.seen <= 1.2
+    then
+        token, goal = intent.token, intent.goal
+    end
+    if
+        unloaded
+        or not FH.ForwardOwner(token)
+        or not hum
+        or not root
+        or hum.Parent ~= LocalPlayer.Character
+        or hum.RootPart ~= root
+        or (motion.token == token and motion.hum ~= hum)
+        or not goal
+        or Flat(goal - root.Position).Magnitude <= 0.5
+        or hum.Health <= 0
+        or hum.Sit
+        or hum.PlatformStand
+        or not FH.MotionAvailable(token)
+        or Ctl.On()
+        or Fly.Active
+        or EM.CurrentData
+        or EM.ComboState
+        or EM.PausedState
+        or (EM.Crawling and EM.Crawling())
+        or UserInputService:GetFocusedTextBox()
+        or FH.True(LocalPlayer, FH.CAP)
+        or FH.True(LocalPlayer, FH.RAG)
+        or FH.IsHacking(token)
+        or FH.IsWorking(token)
+        or Follow.Held
+        or Follow.KeyDown
+        or AR.Held
+        or AR.KeyDown
+        or TR.Held
+        or TR.KeyDown
+        or (Follow.OpeningDoor and Follow.OpeningDoor.token == token and now < Follow.OpeningDoor.untilAt)
+    then
+        FH.ForwardWatch = nil
+        if pulse then FH.ReleaseForward(pulse) end
+        return false
+    end
+    local state = FH.ForwardWatch
+    if
+        not state
+        or state.token ~= token
+        or state.hum ~= hum
+        or state.root ~= root
+        or state.character ~= LocalPlayer.Character
+    then
+        state =
+            { token = token, hum = hum, root = root, character = LocalPlayer.Character, pos = root.Position, at = now }
+        FH.ForwardWatch = state
+        return false
+    end
+    if
+        Flat(root.Position - state.pos).Magnitude >= 0.35
+        or (hum.FloorMaterial ~= Enum.Material.Air and math.abs(root.Position.Y - state.pos.Y) > 0.75)
+    then
+        state.pos, state.at = root.Position, now
+        return false
+    end
+    if now - state.at < 4 then return false end
+    if FH.PeriodicComputerBlocked(root) then
+        state.pos, state.at = root.Position, now
+        return false
+    end
+    if hum.FloorMaterial == Enum.Material.Air then return false end
+    for _, name in ipairs({ "JumpFlight", "Jmp" }) do
+        local flight = FH[name]
+        if flight and flight.hum == hum and flight.root == root and flight.token == token then
+            if now - flight.t <= 1.2 then return false end
+            -- A controller that stopped ticking must not let its expired jump
+            -- ticket suppress the four-second recovery forever after landing.
+            FH[name] = nil
+        end
+    end
+    if Follow.ActiveDrop and Follow.ActiveDrop(token, hum, root) then return false end
+    -- A stalled leg asks its existing planner for a new route even when the
+    -- camera faces a wall and a forward key would be inappropriate.
+    if motion.token == token then motion.replanToken = token end
+    state.pos, state.at = root.Position, now
+    return FH.PressForward(token, hum, root)
+end
 -- Geometry/input recovery is optional for this frame. A transient probe error
 -- must not skip the owned steering that runs after the game's input controller.
 -- Retry a failed helper at most five times per second without renewing leases.
@@ -4324,6 +4553,7 @@ function FH.MotionStep()
     FH.MotionGuardedStep("StairJumpStep")
     FH.MotionGuardedStep("StallJumpStep")
     FH.MotionGuardedStep("PeriodicSpaceStep")
+    FH.MotionGuardedStep("ForwardWatchStep")
     FH.MotionGuardedStep("JumpMoveStep")
     FH.GroundMoveStep()
 end
@@ -4644,6 +4874,7 @@ function FH.TraversalLane(token, hum, root, point, feetY, reachLimit, wantWalk)
 end
 function FH.TryJump(hum, root, aim, feetY, kind, sill)
     local token = FH.Motion and FH.Motion.token
+    if FH.ComputerContactApproach(token, hum, root, aim) then return false end
     local scoped = FH.TraversalOwned(token)
     if
         not hum
@@ -7058,25 +7289,44 @@ function Follow.Hold(ev, minigame, key, fast, owner)
         if minigame then pcall(function() RemoteEvent:FireServer("SetPlayerMinigameResult", true) end) end
         Follow.Held, Follow.InputOwner = ev, owner
     end
-    if (key or not useRemote) and VIM and not Follow.KeyDown and not UserInputService:GetFocusedTextBox() then
-        Ctl.EUntil = os.clock() + 0.5
-        pcall(function() VIM:SendKeyEvent(true, Enum.KeyCode.E, false, game) end)
-        Follow.KeyDown, Follow.InputOwner = true, owner
-        if not Follow.Held then Follow.Held = "key" end
+    if (key or not useRemote) and not Follow.KeyDown and not UserInputService:GetFocusedTextBox() then
+        -- Claim only our injected E hold; a physical player press stays theirs.
+        local heldOK, held = pcall(function() return UserInputService:IsKeyDown(Enum.KeyCode.E) end)
+        if (heldOK and held) or (Ctl.Down and Ctl.Down[Enum.KeyCode.E]) then return end
+        Ctl.EUntil = now + 0.5
+        local pressed = false
+        if type(keypress) == "function" and type(keyrelease) == "function" then
+            pressed = pcall(keypress, 0x45)
+            if pressed then Follow.ERelease = keyrelease end
+        end
+        if not pressed and VIM then
+            pressed = pcall(function() VIM:SendKeyEvent(true, Enum.KeyCode.E, false, game) end)
+            if pressed then Follow.EVim = VIM end
+        end
+        Follow.KeyDown = pressed
+        if pressed then
+            Follow.InputOwner = owner
+            if not Follow.Held then Follow.Held = "key" end
+        end
     end
 end
 function Follow.Release(owner)
     if owner ~= nil and Follow.InputOwner ~= owner then return false end
-    local h, kd = Follow.Held, Follow.KeyDown
+    local h, kd, keyUp, vim = Follow.Held, Follow.KeyDown, Follow.ERelease, Follow.EVim
     if FH.Work and FH.Work.token == Follow.InputOwner then FH.Work = nil end
     Follow.InputOwner = nil
+    Follow.ERelease, Follow.EVim = nil, nil
     if not h and not kd then return end
     Follow.Held = nil
     Follow.KeyDown = false
     Follow.InAt = 0
-    if kd and VIM then
+    if kd and not (Ctl.Down and Ctl.Down[Enum.KeyCode.E]) then
         Ctl.EUntil = os.clock() + 0.5
-        pcall(function() VIM:SendKeyEvent(false, Enum.KeyCode.E, false, game) end)
+        if keyUp then
+            pcall(keyUp, 0x45)
+        elseif vim then
+            pcall(function() vim:SendKeyEvent(false, Enum.KeyCode.E, false, game) end)
+        end
     end
     if h and h ~= "key" and RemoteEvent then
         pcall(function()
@@ -7228,6 +7478,7 @@ function Follow.RescueDoorCrossed(rescueState, goal, g, from, after)
 end
 function Follow.PassDoor(token, g, abort, holdSecs, rescueGoal, rescueState)
     local d = g.Door
+    local stableDoor = type(token) == "number" or (type(token) == "table" and token.owner == "rescue")
     local function alive()
         return d and d.Parent and TokOK(token) and not Ctl.On() and not Fly.Active and not (abort and abort())
     end
@@ -7252,6 +7503,7 @@ function Follow.PassDoor(token, g, abort, holdSecs, rescueGoal, rescueState)
         return true
     end
     local stand
+    local contactStopped = false
     if FH.DoorBlocked(g) then
         local from = g.NearPos
         local tl = FH.Triggers(d)
@@ -7303,7 +7555,8 @@ function Follow.PassDoor(token, g, abort, holdSecs, rescueGoal, rescueState)
             if not FH.DoorBlocked(g) then return true end
             local trigger = list[1]
             if FH.DoorCanHold(g, trigger, current.Position, stand, FH.Feet(hum, current)) then
-                FH.Move(token, hum, current.Position)
+                FH.Move(token, hum, current.Position, stableDoor and not contactStopped)
+                contactStopped = true
                 Follow.Hold(trigger and trigger:FindFirstChild("Event"), false, true, false, token)
                 return true
             end
@@ -7353,15 +7606,24 @@ function Follow.PassDoor(token, g, abort, holdSecs, rescueGoal, rescueState)
                 opened = true
                 break
             else
-                if FH.DoorCanHold(g, tg, root.Position, stand, FH.Feet(hum, root)) then
-                    FH.Move(token, hum, stand)
+                local inRange = FH.DoorCanHold(g, tg, root.Position, stand, FH.Feet(hum, root))
+                if inRange then
+                    -- Stay at a valid trigger until its opening finishes. A
+                    -- stale approach MoveTo or repeated E reset cancels it.
+                    FH.Move(token, hum, stableDoor and root.Position or stand, stableDoor and not contactStopped)
+                    contactStopped = true
                     Follow.Hold(tg and tg:FindFirstChild("Event"), false, true, false, token)
                 else
+                    contactStopped = false
                     Follow.Release(token)
                     FH.Move(token, hum, stand)
                 end
             end
-            if blocked and now >= switchAt then
+            if
+                blocked
+                and now >= switchAt
+                and (not stableDoor or not FH.DoorCanHold(g, tg, root.Position, stand, FH.Feet(hum, root)))
+            then
                 Follow.Release(token)
                 ti = ti % math.max(1, #list) + 1
                 local nextStand = FH.DoorStand(g, list[ti], root.Position, 1)
@@ -7790,6 +8052,7 @@ end
 -- A slow ComputeAsync used to block movement while selecting a door.
 function Follow.PlanDoor(token, rp, goal, abort, choose, rescueGoal, rescueState)
     local done, cancelled, result = false, false, nil
+    local stableDoor = type(token) == "number" or (type(token) == "table" and token.owner == "rescue")
     local state, started = {}, os.clock()
     local doors = Follow.RescueDoorState(rescueState, rescueGoal)
     local doorVersion = doors and doors.version
@@ -7808,6 +8071,16 @@ function Follow.PlanDoor(token, rp, goal, abort, choose, rescueGoal, rescueState
             Follow.Beat = os.clock()
             FH.RefreshFilter()
             FH.Tick(hum, root)
+            -- Once an accepted portal is in interaction range, wait at this
+            -- valid stand; provisional exploration must not leave the door.
+            if stableDoor and type(result) == "table" and result.Door then
+                local stand = (rescueGoal and result.RescueStand) or result.ApproachStand
+                local trig = result.ApproachTrig or result.NearTrig
+                if stand and FH.DoorCanHold(result, trig, root.Position, stand, FH.Feet(hum, root)) then
+                    FH.Move(token, hum, root.Position, true)
+                    return
+                end
+            end
             if not Follow.PlanStep(token, hum, root, steeringGoal, FH.Feet(hum, root), state, rescueGoal) then
                 FH.Move(token, hum, root.Position, false, steeringGoal)
             end
@@ -8080,6 +8353,16 @@ function Follow.FindDoorRoute(
                     end
                 elseif not fallback and Flat(g.FarPos - goal).Magnitude < Flat(rp - goal).Magnitude - 4 then
                     fallback = cands[i]
+                elseif type(token) == "number" and FH.DoorBlocked(g) then
+                    -- A sealed room can require leaving through a door behind
+                    -- us before turning toward the goal. Reachability of its
+                    -- stand, not straight-line progress, permits this exit.
+                    local cost = FH.RouteCost(w1, l1 or 0)
+                        + Flat(g.FarPos - goal).Magnitude
+                        + (DoorTries[g.Door] or 0) * speed * 3
+                    if not fallbackCost or cost < fallbackCost then
+                        fallback, fallbackCost = cands[i], cost
+                    end
                 end
             end
         end
@@ -8705,12 +8988,9 @@ function Follow.WalkTo(token, getGoal, stopDist, abort, opts)
             end
         end
         if badW then fb = fb or { mode = "path", wps = badW, full = true, clearBad = true } end
-        if opts.rescueJuke and not noDoor and not rescueDoorTried then
-            if os.clock() > gridBan and straight < 120 then
-                local gw = FH.Grid(rp, goal, feetY, 96, function() return not dead() end)
-                if dead() then return nil end
-                if gw then return { mode = "path", wps = gw, full = true } end
-            end
+        if physicalRoute and not noDoor and not rescueDoorTried then
+            -- A failed native room route commonly ends at a closed portal.
+            -- Try its reachable trigger before exploring hundreds of grid cells.
             rescueDoorTried = true
             return { mode = "door", fallback = fb }
         end
@@ -9140,6 +9420,41 @@ function Follow.WalkTo(token, getGoal, stopDist, abort, opts)
             end
             local wp = wps[wpi]
             aim = wp.Position
+            local portalDoor = wp.NavDoor
+            if
+                physicalRoute
+                and not portalDoor
+                and wps[wpi + 1]
+                and (wp.Position - Vector3.new(rp.X, feetY, rp.Z)).Magnitude <= 1.2
+            then
+                -- A turn at the near anchor cannot advance through a closed
+                -- panel. Its following far-side waypoint names this doorway.
+                portalDoor = wps[wpi + 1].NavDoor
+            end
+            if physicalRoute and not flying and not noDoor and portalDoor and now - doorAt > 1.0 then
+                local door = portalDoor
+                local g = IsInWorld(door) and FH.DoorGeom(door, rp)
+                if
+                    g
+                    and Flat(g.Center - rp).Magnitude <= 18
+                    and FH.DoorOnFloor(g, rp, feetY)
+                    and FH.DoorBlocked(g)
+                    and not (DoorFail[door] and now < DoorFail[door])
+                    and doorTries < 10
+                then
+                    -- The atlas names the actual portal, so walk to its usable
+                    -- trigger instead of running into its closed panel first.
+                    doorAt, doorTries = now, doorTries + 1
+                    local passed = Follow.PassDoor(token, g, abort, nil, opts.rescueJuke, pendingSteer)
+                    if not alive() then return finish("abort", false) end
+                    if not passed then banDirect = math.max(banDirect, os.clock() + 2) end
+                    reset()
+                    rescueDoorTried = false
+                    stuck = 0
+                    task.wait()
+                    continue
+                end
+            end
             if wp.Action == Enum.PathWaypointAction.Jump then
                 if Flat(wp.Position - rp).Magnitude < 4.5 then waypointJump(wpi, hum, root, now) end
             elseif routeProgress then
@@ -10240,6 +10555,7 @@ function Follow.Main(token, player)
     local wasBusy = false
     local fwPos, fwAt = nil, os.clock()
     local exitState = {}
+    local farmComputer = nil
     local function setLabel(t)
         if label ~= t then
             label = t
@@ -10370,6 +10686,19 @@ function Follow.Main(token, player)
         local map = GetCurrentMap()
         local best, bs
         local now = os.clock()
+        if not soft and farmComputer then
+            local skipped = hackSkip[farmComputer] and hackSkip[farmComputer] > now
+            if
+                not skipped
+                and not isTimedOut(farmComputer)
+                and IsRealComputer(farmComputer, map)
+                and not compDone(farmComputer)
+                and not AH.Unsafe(farmComputer:GetPivot().Position)
+            then
+                return farmComputer
+            end
+            farmComputer = nil
+        end
         for _, comp in ipairs(Computers) do
             local skipped = hackSkip[comp] and hackSkip[comp] > now
             if (soft or not skipped) and not isTimedOut(comp) and IsRealComputer(comp, map) and not compDone(comp) then
@@ -10382,6 +10711,7 @@ function Follow.Main(token, player)
                 end
             end
         end
+        if not soft then farmComputer = best end
         return best
     end
 
@@ -10428,6 +10758,8 @@ function Follow.Main(token, player)
         return free
     end
     local function hackComputer(comp, extraStop, avoid, farmMode)
+        local previous = Follow.ComputerApproach
+        if previous and previous.token == token then Follow.ComputerApproach = nil end
         if FH.ExitOpen() then return end
         if isTimedOut(comp) or compDone(comp) then return end
         local trigs = computerTriggers(comp, avoid)
@@ -10435,9 +10767,78 @@ function Follow.Main(token, player)
             hackSkip[comp] = os.clock() + 3
             return
         end
+        local function clearApproach()
+            local approach = Follow.ComputerApproach
+            if approach and approach.token == token then Follow.ComputerApproach = nil end
+        end
+        local function markApproach(trig, hum, root)
+            local approach = Follow.ComputerApproach
+            if
+                not approach
+                or approach.token ~= token
+                or approach.comp ~= comp
+                or approach.trig ~= trig
+                or approach.hum ~= hum
+                or approach.root ~= root
+            then
+                approach = { token = token, comp = comp, trig = trig, hum = hum, root = root }
+                Follow.ComputerApproach = approach
+            end
+            approach.untilAt = os.clock() + 0.16
+        end
         local function stop()
-            if not go() or meBad() or not comp.Parent or compDone(comp) or FH.ExitOpen() then return true end
-            return extraStop ~= nil and extraStop() or false
+            local stopped = not go()
+                or meBad()
+                or not comp.Parent
+                or compDone(comp)
+                or FH.ExitOpen()
+                or (extraStop ~= nil and extraStop())
+            if stopped then clearApproach() end
+            return stopped
+        end
+        local contactCheck
+        local function contact(trig, range)
+            local hum, mr = GetHumanoid(), myRoot()
+            if
+                not (hum and mr and trig.Parent)
+                or Flat(mr.Position - trig.Position).Magnitude > range
+                or math.abs(mr.Position.Y - trig.Position.Y) > 3.6
+            then
+                return false, hum, mr
+            end
+            local now = os.clock()
+            if
+                not contactCheck
+                or contactCheck.trig ~= trig
+                or contactCheck.hum ~= hum
+                or contactCheck.root ~= mr
+                or now - contactCheck.at >= 0.12
+                or (contactCheck.pos - mr.Position).Magnitude > 0.15
+                or (contactCheck.goal - trig.Position).Magnitude > 0.05
+            then
+                contactCheck = {
+                    trig = trig,
+                    hum = hum,
+                    root = mr,
+                    pos = mr.Position,
+                    goal = trig.Position,
+                    at = now,
+                    clear = Follow.GoalOnFloor(hum, mr, trig.Position, comp)
+                        and FH.ApproachClear(mr.Position, trig.Position, comp),
+                }
+            end
+            return contactCheck.clear, hum, mr
+        end
+        local function approach(trig)
+            local untilAt = os.clock() + 0.8
+            while not stop() and os.clock() < untilAt and contact(trig, 6) and not contact(trig, 3.2) do
+                local _, hum, root = contact(trig, 6)
+                markApproach(trig, hum, root)
+                Follow.Beat = os.clock()
+                FH.Move(token, hum, trig.Position)
+                task.wait(0.04)
+            end
+            clearApproach()
         end
         local lastChk, lastRes = 0, false
         local function lost(trig)
@@ -10464,42 +10865,44 @@ function Follow.Main(token, player)
             lastRes = not ok
             return lastRes
         end
+        local routeFailed = false
         for ti = 1, #trigs do
             local trig = trigs[ti]
             local ev = trig:FindFirstChild("Event")
             lastChk = 0
             local walkLost = false
-            local res = Follow.WalkTo(token, function() return trig.Position end, 1.0, function()
-                if stop() then return true end
-                if lost(trig) then
-                    walkLost = true
-                    return true
-                end
-                return false
-            end, { maxTime = 30, nearOk = 3.2, approachModel = comp })
+            local res = "arrived"
+            -- A visible terminal is already the end of the route. Finish this
+            -- short approach without rerouting around the computer's own body.
+            local approached = contact(trig, 6)
+            if approached then approach(trig) end
+            if not stop() and not contact(trig, 3.2) then
+                res = Follow.WalkTo(token, function() return trig.Position end, 1.0, function()
+                    if stop() or contact(trig, 3.2) or (not approached and contact(trig, 6)) then return true end
+                    if lost(trig) then
+                        walkLost = true
+                        return true
+                    end
+                    return false
+                end, { maxTime = 30, nearOk = 3.2, approachModel = comp })
+                if not stop() and res ~= "nopath" and res ~= "stuck" and res ~= "timeout" then approach(trig) end
+            end
             if stop() then
                 Follow.Release(token)
                 return
             end
             if walkLost then continue end
 
-            local mr = myRoot()
-            local near = mr
-                and Flat(mr.Position - trig.Position).Magnitude <= 6
-                and math.abs(mr.Position.Y - trig.Position.Y) <= 3.6
-                and Follow.GoalOnFloor(GetHumanoid(), mr, trig.Position, comp)
-                and FH.ApproachClear(mr.Position, trig.Position, comp)
+            local near = contact(trig, 3.2)
             if not near then
-                if res == "nopath" or res == "stuck" or res == "timeout" then
-                    hackSkip[comp] = os.clock() + 10
-                    return
-                end
+                if res == "nopath" or res == "stuck" or res == "timeout" then routeFailed = true end
                 continue
             end
 
             local routeLost = false
             local t0 = os.clock()
             local st = { on = false }
+            local holding = false
             while not stop() and os.clock() - t0 < Follow.HackMax do
                 Follow.Beat = os.clock()
                 if Ctl.Gate() then
@@ -10515,24 +10918,36 @@ function Follow.Main(token, player)
                     local offset = trig.Position - r2.Position
                     -- A fall or floor change requires navigation again. A raw
                     -- vertical Move cannot find the stairs back to this trigger.
-                    if math.abs(offset.Y) > 3.6 or not Follow.GoalOnFloor(hum, r2, trig.Position, comp) then
+                    if math.abs(offset.Y) > 3.6 or not contact(trig, 6) then
                         Follow.Release(token)
                         routeLost = true
                         break
                     end
                     local dist = math.abs(offset.Y) <= 3.6 and Flat(offset).Magnitude or math.huge
-                    if FH.CanHold(st, dist, 1.5, 4.2) then
-                        FH.Move(token, hum, r2.Position)
+                    if FH.CanHold(st, dist, 3.2, 4.2) then
+                        clearApproach()
+                        -- Force this first stationary aim through the movement
+                        -- cache before E, so an older waypoint cannot drag us away.
+                        FH.Move(token, hum, r2.Position, not holding)
                         Follow.Hold(ev, Follow.HackSendResult)
                         FH.MarkWork(token, "hack")
+                        holding = true
                         fwPos, fwAt = r2.Position, os.clock()
                     else
                         Follow.Release(token)
-                        FH.Move(token, hum, trig.Position)
+                        holding = false
+                        if contact(trig, 6) then
+                            markApproach(trig, hum, r2)
+                            FH.Move(token, hum, trig.Position)
+                        else
+                            routeLost = true
+                            break
+                        end
                     end
                 end
                 task.wait(0.04)
             end
+            clearApproach()
             Follow.Release(token)
             if compDone(comp) then
                 doneComputers[comp] = true
@@ -10548,7 +10963,8 @@ function Follow.Main(token, player)
             FH.HackFail = FH.HackFail + 1
             return
         end
-        hackSkip[comp] = os.clock() + (farmMode and 4 or 6)
+        clearApproach()
+        hackSkip[comp] = os.clock() + (routeFailed and 10 or (farmMode and 4 or 6))
     end
     local function farmWatch()
         local r = myRoot()
@@ -11009,6 +11425,8 @@ function Follow.Main(token, player)
                 followStep(beast)
             end)
             if not ok then
+                local approach = Follow.ComputerApproach
+                if approach and approach.token == token then Follow.ComputerApproach = nil end
                 warn("[Follow] loi: " .. tostring(err))
                 pcall(Follow.Release, token)
                 task.wait(0.3)
@@ -11016,6 +11434,8 @@ function Follow.Main(token, player)
             task.wait(0.02)
         end
     end
+    local approach = Follow.ComputerApproach
+    if approach and approach.token == token then Follow.ComputerApproach = nil end
 end
 -- ================= AUTO HIDE [9] =================
 -- A companion E tap never owns movement or steals an interaction held by another feature.
@@ -20611,6 +21031,7 @@ local function UnloadHack()
     if unloaded then return end
     unloaded = true
     pcall(FH.ReleaseSpace)
+    pcall(FH.ReleaseForward)
     pcall(EM.Stop)
     EX.Mode = "closed"
     pcall(EX.StopSpectate)
