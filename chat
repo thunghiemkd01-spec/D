@@ -1,1 +1,1065 @@
+-- Tom Player: standalone offline Roblox chat companion.
+-- Execute this entire file once in the Roblox client; no D or API is required.
+-- '=' or one click on X: enable/pause. Double-click X: unload everything.
+-- Red = paused (default); green = enabled. Re-execution replaces the old copy.
+-- 2,000 distinct prepared lines across 40 topics; account names are read live.
+-- Roblox still controls chat availability and moderation. Do not bypass it.
 
+local Config = {
+    StartEnabled = false,
+    MinGap = 5,
+    MaxGap = 6,
+    MaxQueue = 1,
+    StaleAfter = 12,
+    FollowWindow = 25,
+    RecentBlock = 20,
+    ReplyDelay = 0.7,
+    DoubleClickWindow = 0.3,
+    IdleOpenerAfter = 40,
+    AllowIdleOpeners = true,
+    MaxInputLength = 320,
+    MaxSessions = 64,
+}
+
+local Bank = {
+    { tag = "greet", group = "greeting", triggers = { "hi", "hello", "hey", "yo", "sup", "wassup", "wsp", "good morning", "gm", "good evening", "good afternoon" }, replies = {
+        "yo whats good?", "hey welcome in", "sup fellow escape artist", "hello from the lobby", "morning sleepy squad",
+        "evening game crew", "hey hows your day?", "yo ready for a round?", "hiya new lobby friend", "sup hows the server?",
+        "hey made it here", "hello keyboard warrior", "yo nice timing", "morning lets warm up", "evening lets chill",
+        "hey grab a comfy spot", "sup found any good servers?", "hello fancy seeing you", "yo lobby feels alive", "hey hows the ping?",
+        "hiya lets keep it chill", "morning got any plans?", "evening still gaming?", "yo whats the mission?", "hey good to see you",
+        "sup lobby explorer", "hello tiny chat corner", "yo survived the loading screen", "hey hopping in too?", "morning snack acquired?",
+        "afternoon gaming break?", "evening squad assembled", "sup got room for tom?", "hey whats happening here?", "hello made a dramatic entrance",
+        "yo quiet lobby today?", "hiya ready to chill?", "morning fresh lobby energy", "evening one more round?", "sup new round new hope",
+        "hey whats everyone playing?", "hello the chat woke up", "yo welcome to the chaos", "hey good lobby vibes", "morning coffee or juice?",
+        "evening how was today?", "sup staying for a bit?", "hiya meet the chat crew", "hey new face spotted", "yo lets make this fun",
+    } },
+    { tag = "wellbeing", group = "social", triggers = { "how are you", "how r u", "hru", "how you doing", "how are u", "you good", "u good", "whats up", "what is up" }, replies = {
+        "im good how about you?", "pretty chill rn", "doing alright thanks for asking", "vibing between rounds", "all good on this side",
+        "im fine hows your day?", "lowkey ready for snacks", "feeling like another round", "just chilling in chat", "not bad whats new?",
+        "im alright you holding up?", "my mood is lobby music", "doing okay keeping it easy", "pretty good got any news?", "chilling whats your vibe?",
+        "feeling a little sleepy", "im fine still here", "calm day so far", "my brain wants a break", "im good you having fun?",
+        "currently powered by curiosity", "feeling relaxed rn", "im okay hows life?", "cant complain about this lobby", "just enjoying the conversation",
+        "doing decent and staying cozy", "feeling like a snack break", "all chill how about yours?", "im alright anything exciting today?", "not much just hanging out",
+        "my energy is medium today", "im good thanks bro", "chilling with the lobby crew", "pretty okay keeping things light", "im fine any fun plans?",
+        "today feels like casual gaming", "doing well hope you are", "im alright just taking it easy", "feeling like a quiet round", "all good got a story?",
+        "my mood is pretty mellow", "im okay whats your mood?", "still vibing no big news", "im good how was your morning?", "relaxed and reading chat",
+        "doing fine got a favorite map?", "im alright nice of you", "feeling pleasantly distracted", "good enough for some banter", "im chill lets hear your update",
+    } },
+    { tag = "activity", group = "social", triggers = { "what are you doing", "what r u doing", "wyd", "what you doing", "doing rn", "whatcha doing", "what are u doing", "wya" }, replies = {
+        "just hanging out here", "reading the lobby chat", "waiting for the next round", "keeping the chat company", "im chatting what about you?",
+        "watching the lobby vibes", "thinking about snacks again", "currently on chat duty", "just chilling between games", "collecting random conversation topics",
+        "making the silence less awkward", "talking with whoever drops by", "im here whats your plan?", "keeping things casual rn", "waiting to hear your story",
+        "choosing my next imaginary snack", "enjoying this little game break", "listening to the conversation", "doing a whole lotta chilling", "deciding which topic wins",
+        "mostly hanging out with you", "just being tom in chat", "got any ideas for conversation?", "im chatting got a question?", "keeping an eye on chat",
+        "waiting for a good joke", "mentally ranking lobby vibes", "just spending some time here", "catching up with the chatter", "not doing anything dramatic",
+        "having a tiny social break", "thinking about the next topic", "chilling while everyone plays", "waiting for your next message", "pretending the lobby is cozy",
+        "talking games and random stuff", "finding something fun to discuss", "just here for friendly chat", "im around whats happening?", "considering another snack debate",
+        "enjoying a calm chat moment", "waiting for an interesting question", "doing my best lobby impression", "chatting through the downtime", "watching this conversation unfold",
+        "not much got any stories?", "trying to keep things fun", "spending the break in chat", "just floating around the conversation", "im here ready to chat",
+    } },
+    { tag = "farewell", group = "greeting", triggers = { "bye", "goodbye", "gtg", "gotta go", "brb", "be right back", "afk", "see you", "cya", "good night", "gn", "im back", "back again" }, replies = {
+        "see ya take care", "catch you next round", "later have a good one", "bye enjoy your break", "alr see you around",
+        "rest well game friend", "good night sleep easy", "brb accepted snack mission starts", "see you when youre back", "later lobby legend",
+        "take your time bro", "have a chill evening", "bye thanks for hanging out", "catch you in another lobby", "alr dont rush back",
+        "enjoy your food break", "have a cozy night", "later hope today goes well", "see ya good games", "bye go recharge a bit",
+        "take care of yourself", "rest up tomorrow exists", "catch you after the break", "alr enjoy the real world", "see ya keyboard gets rest",
+        "bye the lobby will survive", "have a peaceful break", "later bring a story back", "sleep well avoid late scrolling", "see you after snacks",
+        "alr have fun out there", "bye that was a good chat", "catch you whenever youre free", "good night cozy blanket time", "take a break you earned one",
+        "later dont forget your water", "see ya nice chatting", "enjoy some quiet time", "bye safe travels around life", "alr your break comes first",
+        "catch you on the return trip", "later enjoy the downtime", "sleep easy lobby friend", "see ya good luck today", "bye go enjoy your plans",
+        "take care till next time", "alr see you after afk", "later let the keyboard cool", "bye come back whenever", "catch you soon maybe",
+    } },
+    { tag = "gratitude", group = "thanks", triggers = { "thanks", "thank you", "ty", "thx", "tysm", "appreciate it", "thank u", "thankyou" }, replies = {
+        "youre welcome bro", "anytime glad to chat", "happy that helped", "no problem at all", "got you game friend",
+        "all good appreciate you too", "glad it made sense", "youre welcome keep going", "always happy to explain", "no worries were chilling",
+        "nice glad you found that useful", "you got this too", "thanks for saying that", "happy to share a thought", "all chill no big deal",
+        "youre welcome hows it going?", "glad we sorted that out", "anytime keep the questions coming", "no problem enjoy the round", "happy the idea landed",
+        "were good dont sweat it", "youre welcome nice teamwork", "glad that cleared things up", "no worries thats what chats for", "appreciate the kind words",
+        "happy to keep you company", "all good hope it helps", "youre welcome want another tip?", "glad you asked first", "no problem good luck next",
+        "anytime thats a solid question", "happy to help with chat", "all chill keep enjoying yourself", "youre welcome friend", "glad the explanation worked",
+        "no worries lets keep chatting", "thanks for being kind", "happy we figured that out", "all good no favor owed", "youre welcome got another question?",
+        "glad it was worth asking", "no problem keep things chill", "anytime good conversations are fun", "happy to bounce ideas around", "all chill hope the round improves",
+        "youre welcome stay cozy", "glad we could talk", "no worries youre doing fine", "thanks that means a lot", "happy to share the lobby",
+    } },
+    { tag = "apology", group = "thanks", triggers = { "sorry", "sry", "my bad", "mb", "oops", "my fault", "didnt mean", "did not mean" }, replies = {
+        "all good mistakes happen", "no stress bro", "we chill dont worry", "its okay keep going", "no worries fresh start",
+        "mb happens to everyone", "youre fine lets move forward", "one mistake isnt everything", "all chill no hard feelings", "its okay take a breath",
+        "we can reset the vibe", "no stress the round continues", "mistakes make funny stories later", "youre good thanks for saying", "all fine nobody plays perfectly",
+        "dont let that ruin today", "its alright we move", "no worries try again next round", "we chill that happens", "your apology is appreciated",
+        "all good lets keep chatting", "its okay small hiccup", "no stress new chance ahead", "youre fine take your time", "mistakes arent your whole story",
+        "dont worry about that one", "all chill we learned something", "its alright no dramatic sequel", "we can laugh about it later", "no worries keep it friendly",
+        "youre good nobody is perfect", "that wasnt the whole round", "all fine lets restart the topic", "its okay honest mistakes count", "no stress thanks for explaining",
+        "we chill lets try again", "one oops isnt a disaster", "youre fine no need to spiral", "all good appreciate the honesty", "its alright lets stay calm",
+        "no worries fresh round soon", "dont be too hard on yourself", "we can leave that behind", "youre good that was understandable", "all chill better luck next",
+        "its okay nobody kept score", "no stress lets drop the awkwardness", "mistakes are part of learning", "we chill thanks for owning it", "youre fine back to the fun",
+    } },
+    { tag = "compliment", group = "thanks", triggers = { "nice", "good job", "well played", "wp", "youre good", "you are good", "cool skin", "nice skin", "awesome", "congrats" }, replies = {
+        "thats really kind of you", "appreciate that good vibes", "youre pretty cool too", "thanks for the little boost", "kind words hit different",
+        "glad you like the vibe", "that made chat nicer", "appreciate it lets stay chill", "you noticed the tiny details", "thanks got a favorite skin?",
+        "kind of you to say", "that praise deserves a tiny bow", "glad the look works", "appreciate you keeping it positive", "you brought the good energy",
+        "thanks thats a nice compliment", "kind words are a solid buff", "glad youre enjoying yourself", "that was a wholesome moment", "appreciate it hows your round?",
+        "you made the lobby friendlier", "thanks what style do you like?", "kindness is honestly underrated", "glad you said something nice", "that compliment has good timing",
+        "appreciate the friendly energy", "you deserve some good vibes too", "thanks lets keep that energy", "kind words no receipt needed", "glad the chat feels fun",
+        "that was a generous rating", "appreciate it youre being sweet", "you have a good eye", "thanks got any style ideas?", "kindness wins this little round",
+        "glad you like it bro", "that made this moment better", "appreciate the wholesome comment", "you brought a nice vibe", "thanks thats a lobby win",
+        "kind words accepted with gratitude", "glad the conversation works", "that compliment got a smile", "appreciate you stopping to say", "you keep the chat cozy",
+        "thanks hope your round goes well", "kindness is the best accessory", "glad were keeping things friendly", "that was a lovely little boost", "appreciate it now your turn",
+    } },
+    { tag = "account_name", group = "bot", triggers = { "whats your name", "what is your name", "your username", "ur username", "your display name", "ur name", "who are you", "whats ur name", "what should i call you", "who is tom", "who is tommy" }, replies = {
+        "call me tom", "tom is my chat nickname", "im tom nice to meet you", "your username is {speaker}", "my username is {username}",
+        "my display name is {display}", "you can find me as {username}", "the account username is {username}", "this accounts display name is {display}", "tom here whats your nickname?",
+        "im tom in this chat", "your display name is {speakerdisplay}", "my roblox account is {username}", "the name above me is {display}", "tom is the easy version",
+        "username says {username}", "display name says {display}", "i only share my roblox name", "tom is the nickname i use", "im tom the chat buddy",
+        "the profile username is {username}", "the display name reads {display}", "tom or tommy your choice", "this is the {username} account", "tom is my lobby nickname",
+        "my public account name is {username}", "my public display name is {display}", "you found tom right here", "tom reporting from chat", "the account goes by {username}",
+        "the display label is {display}", "tom is short and easy", "im tom whats your game name?", "username and nickname are different", "my nickname here is tommy",
+        "{username} is the username here", "{display} is the display name here", "youre talking to tom", "tom is what i answer to", "roblox knows this account as {username}",
+        "the lobby shows {display}", "tom is the friendly nickname", "im tom pleased to meet you", "for the username its {username}", "for the display name its {display}",
+        "tom fits the chat vibe", "tommy also gets my attention", "my account handle is {username}", "my current display name is {display}", "just call me tom bro",
+    } },
+    { tag = "chatbot_identity", group = "bot", triggers = { "are you a bot", "are u a bot", "you a bot", "ur a bot", "youre a bot", "are you real", "are u real", "are you human", "are u human", "npc", "robot", "chatbot", "are you ai" }, replies = {
+        "yep im a chat bot", "tom the chat bot here", "scripted chat buddy reporting", "yeah i use prepared replies", "bot with a casual nickname",
+        "im here to keep chat company", "you spotted the chat bot", "yep still happy to chat", "tom is a little chatbot", "im scripted whats your question?",
+        "yeah my replies are prewritten", "chat bot with lobby manners", "you guessed it bro", "im a bot named tom", "yep no mystery reveal needed",
+        "scripted but keeping things friendly", "im the tiny chat companion", "bot here got a topic?", "yeah this is automated chat", "tom is a prepared reply bot",
+        "yep its a chatbot script", "you found the chat helper", "im automated and reading chat", "bot energy confirmed", "yeah still down for conversation",
+        "tom the scripted lobby buddy", "yep i pick matching replies", "chatbot with snack opinions", "im a chat bot without a hometown", "im a chat bot without an age",
+        "yeah this chats automated", "you cracked that tiny mystery", "im a scripted conversation buddy", "yep got another question?", "tom runs on prepared chat",
+        "chatbot trying to stay polite", "yeah a small offline bot", "im the scripted chat corner", "bot confirmed conversation available", "yep prewritten lines doing work",
+        "tom is the chatbot nickname", "youre chatting with a script", "yeah replies come from a bank", "im here for casual conversation", "bot with a friendly tone",
+        "yep no human claim here", "tom the automated chat buddy", "chatbot answers when enabled", "yeah im a conversation script", "you spotted toms bot mode",
+    } },
+    { tag = "hobbies", group = "bot", triggers = { "what do you like", "what do u like", "your hobby", "ur hobby", "favorite thing", "favourite thing", "hobbies", "what you like", "your favorite", "ur favorite" }, replies = {
+        "i like a friendly lobby", "good jokes are my thing", "im into casual game chats", "snack debates are pretty fun", "cozy vibes get my vote",
+        "i like clever little questions", "game stories are always welcome", "friendly banter works for me", "random facts are kinda cool", "i like hearing peoples game takes",
+        "chill conversations are my favorite", "tiny mysteries make good topics", "im into harmless wordplay", "interesting map debates are fun", "i like creative avatar styles",
+        "good music talk is welcome", "pet stories usually win", "i like a relaxed round", "fun questions beat awkward silence", "im into silly comparisons",
+        "cozy games sound pretty nice", "i like a positive chat", "unexpected jokes get my attention", "game design is a fun topic", "im into tiny trivia questions",
+        "i like funny lobby moments", "food rankings are dangerously entertaining", "im partial to calm game breaks", "interesting stories make chat better", "i like playful what ifs",
+        "good teamwork is a nice vibe", "im into friendly challenges", "music recommendations are fun to discuss", "i like thoughtful game opinions", "animal facts are neat",
+        "creative ideas keep things interesting", "im into low pressure conversation", "i like a good map discussion", "gentle jokes are my lane", "cozy food talk gets a vote",
+        "i like curious people in chat", "funny round recaps are solid", "im into wholesome lobby energy", "i like hearing different opinions", "quick riddles are a good topic",
+        "avatar creativity is pretty cool", "i like a calm friendly server", "lighthearted debates make nice breaks", "im into games with good atmosphere", "i like keeping the conversation easy",
+    } },
+    { tag = "friendship", group = "invite", triggers = { "want to play", "wanna play", "play with me", "join me", "follow me", "come here", "lets play", "be friends", "add me", "friend request", "are we friends" }, replies = {
+        "im here for chat company", "happy to hang out in chat", "we can talk while you play", "ask the squad to join too", "im only chatting here bro",
+        "game talk sounds good to me", "we can keep each other company", "im down for a chat challenge", "want a quick trivia question?", "lets make the lobby friendly",
+        "chat friends sounds pretty chill", "im not controlling the character", "you can invite a playing teammate", "happy to chat between rounds", "lets trade some game opinions",
+        "got a topic for us?", "im here if you wanna talk", "we can do a word game", "ask someone free in the lobby", "ill stick to the chat side",
+        "friendly conversation is welcome", "want a tiny guessing game?", "we can chat about that game", "im a chat buddy only", "lets keep the good vibes going",
+        "got a fun challenge in mind?", "im happy to talk with you", "game invites need a playing person", "lets try a little riddle", "we can discuss your next round",
+        "im here to chat not move", "friendly lobby crew sounds nice", "want to compare favorite maps?", "im around for the conversation", "ask your teammate for movement",
+        "lets keep this chat friendly", "we can do a quick ranking", "happy to be your chat buddy", "got any game recommendations?", "im not sending friend requests",
+        "lets hear your game plan", "we can talk during downtime", "im down for friendly banter", "want to swap silly questions?", "ask a player to team up",
+        "im keeping things chat only", "lets start with a favorite game", "happy to share the conversation", "got a harmless challenge ready?", "we can hang out right here",
+    } },
+    { tag = "humor", group = "humor", triggers = { "tell me a joke", "tell a joke", "joke", "make me laugh", "funny", "lol", "lmao", "haha", "hehe", "pun", "roast me" }, replies = {
+        "my snack budget has vanished", "the loading screen knows patience", "my plan forgot its own plan", "the lobby chairs deserve overtime", "my imaginary coffee needs coffee",
+        "that keyboard has seen things", "plot twist the snack won", "my brain took the scenic route", "the floor passed the vibe check", "my dramatic entrance needed subtitles",
+        "that joke needs a tiny trophy", "my backup plan needs backup", "the loading bar is sightseeing", "my sandwich has better timing", "plot armor currently on vacation",
+        "the lobby is my waiting room", "my thoughts are buffering politely", "that moment deserves cartoon music", "my snack has main character energy", "the keyboard requested a holiday",
+        "my confidence forgot the map", "this joke came without instructions", "the floor said welcome back", "my imaginary chair has wheels", "plot twist the door had opinions",
+        "the loading screen is committed", "my plan was mostly vibes", "that pause was cinematic", "my snack ranking needs peer review", "the lobby music carries everything",
+        "my attention went for snacks", "this plot needs better directions", "the chair is carrying the team", "my imaginary trophy is cardboard", "plot twist i misplaced the plot",
+        "the keyboard has excellent excuses", "my joke budget is pocket change", "that timing was suspiciously artistic", "my brain chose the wrong tab", "the waiting room got an update",
+        "my snack strategy is undefeated", "this moment needs a laugh track", "the floor is a loyal teammate", "my imaginary cape caught the door", "plot twist patience is the boss",
+        "the loading bar is doing yoga", "my plan has decorative value", "that entrance was budget cinema", "my snack deserves a sequel", "the lobby chairs are the veterans",
+    } },
+    { tag = "latency", group = "game", triggers = { "lag", "lagging", "ping", "fps", "freeze", "stutter", "slow game", "low fps", "delay", "laggy", "disconnect" }, replies = {
+        "lag picked the worst moment", "ping really changed the plot", "thats rough how bad is it?", "lower graphics might ease rendering", "check if background apps are busy",
+        "connection delay and fps are different", "the server might be struggling too", "try a quieter server later", "lag makes timing feel weird", "hope the connection settles soon",
+        "that delay sounds frustrating", "fps drops affect visual smoothness", "high ping delays server responses", "restart only when you can safely", "is it everyone or just you?",
+        "the loading screen wants revenge", "lag should pay rent here", "check your connection before blaming aim", "fewer background tasks may help", "server distance can affect ping",
+        "thats an unfortunate timing tax", "try reducing heavy visual settings", "wifi congestion can cause delays", "is the lag constant or sudden?", "the server took a thinking break",
+        "lag doesnt count as a strategy", "low fps can make inputs feel late", "watch whether ping spikes too", "closing heavy apps might help", "hope next round feels smoother",
+        "thats a rough connection moment", "different servers may perform differently", "unstable wifi can cause packet loss", "did it start this round?", "the game owes you smoother frames",
+        "lag stole that clean timing", "turning graphics down may help fps", "ping depends partly on network routing", "device heat can lower performance", "is the camera stuttering too?",
+        "thats annoying during a chase", "try a short break if needed", "dont change everything at once", "watch which setting actually helps", "hope the server wakes up",
+        "lag has terrible comedic timing", "slow rendering isnt always network lag", "check for downloads using bandwidth", "another server is worth comparing", "did your ping jump suddenly?",
+    } },
+    { tag = "game_chat", group = "game", triggers = { "favorite game", "favourite game", "best game", "roblox", "gaming", "games", "what game", "game update", "update", "bug", "skin", "robux", "trade", "giveaway", "rank" }, replies = {
+        "what kind of games do you like?", "cozy games have great vibes", "good atmosphere can carry a game", "whats your current favorite?", "updates are fun when they work",
+        "small bugs can cause big confusion", "creative skins deserve some credit", "pick the style you actually like", "what makes that game fun?", "casual rounds are underrated",
+        "sound design matters a lot", "got a game recommendation?", "good controls make a huge difference", "maps need clear readable routes", "which update changed things most?",
+        "fun beats chasing every trend", "im more into friendly game talk", "official announcements beat random rumors", "whats the best part of it?", "good teamwork makes games memorable",
+        "cozy building games sound relaxing", "got a favorite game soundtrack?", "horror atmosphere needs good pacing", "competitive games can be pretty intense", "which mechanic feels most satisfying?",
+        "keep trades within official systems", "im not handling trades or giveaways", "never share your account credentials", "whats your favorite avatar theme?", "simple games can still be excellent",
+        "good tutorials save a lot of confusion", "got any underrated game picks?", "racing games need responsive controls", "survival games reward planning", "which mode do you enjoy most?",
+        "official game rules come first", "im not helping with cheats", "random trade promises deserve caution", "whats your ideal game update?", "story games need a good hook",
+        "creative communities make games better", "got a favorite game moment?", "mobile controls can take practice", "pc isnt automatically more fun", "which platform feels best to you?",
+        "reasonable breaks keep gaming enjoyable", "bugs are better with clear reports", "no confirmed update date from me", "whats the game you keep returning to?", "great replay value beats flashy menus",
+    } },
+    { tag = "ftf_basics", group = "ftf", triggers = { "how to play", "how do i play", "ftf tips", "flee the facility", "new player", "im new", "beginner", "how to win", "survivor tips", "tutorial" }, replies = {
+        "hack computers then reach an exit", "rescue teammates when the route is safe", "keep an escape route in mind", "watch the beast warning carefully", "listen for danger while hacking",
+        "learn where doors and windows lead", "dont leave every exit route closed", "teamwork makes the round easier", "keep track of completed computers", "practice timing the skill checks",
+        "new players need a little patience", "use the map to plan turns", "look for another route when blocked", "dont rush into a guarded pod", "keep nearby windows in mind",
+        "which part feels confusing?", "survivors need computers to unlock exits", "open doors before a chase if safe", "learn your maps one round at a time", "keep your camera checking nearby paths",
+        "stay aware while the progress builds", "safe rescues matter more than rushing", "dont follow teammates without a plan", "check both sides before a turn", "learn where the exit triggers are",
+        "want a tip for a specific map?", "save a clear route away from computers", "choose teamwork over random panic", "watch where the beast last went", "practice one skill each round",
+        "good routes beat unnecessary running", "you can learn from each escape", "dont assume every door stays open", "notice windows that connect rooms", "which role are you learning?",
+        "keep your movement plans simple", "find computers while staying alert", "help free teammates when possible", "learn which rooms have extra exits", "give yourself space to turn",
+        "the first rounds are for learning", "stay calm after a missed check", "keep the squad informed in chat", "watch whether an exit is guarded", "what keeps catching you out?",
+        "map knowledge grows with practice", "dont force a route through danger", "safe timing can beat raw speed", "check the escape direction before committing", "want hacking or chase advice?",
+    } },
+    { tag = "ftf_computer", group = "ftf", triggers = { "computer", "computers", "comp", "pc", "hacking", "hack a computer", "hack computer", "progress bar", "almost done", "last comp", "last pc" }, replies = {
+        "keep watching nearby escape routes", "that progress bar tests patience", "how far along is the computer?", "listen for the beast while hacking", "dont let the screen steal awareness",
+        "nearly done keep your timing steady", "which room is that computer in?", "another teammate can help progress", "keep a door route ready", "watch the skill check cue",
+        "that last bit feels extra slow", "dont panic near the finish", "is the beast close to that room?", "clear exits matter before hacking", "remember which computers are finished",
+        "steady timing gets better with practice", "can you hear danger nearby?", "keep your camera checking the doorway", "the screen doesnt watch your back", "look for a safe approach first",
+        "one clean finish can change things", "dont assume that room is safe", "is another teammate helping there?", "give yourself room to leave", "that progress bar has dramatic pacing",
+        "avoid crowding the same escape lane", "which computer is still unfinished?", "keep track of the nearby doors", "a quick camera check can help", "the last computer needs patience too",
+        "slow steady checks beat random inputs", "dont ignore movement sounds nearby", "is there a window beside it?", "plan the getaway before the finish", "keep the team updated on progress",
+        "that screen is the current mission", "can the squad cover another computer?", "dont tunnel vision into the bar", "leave if danger makes staying risky", "know where the next turn leads",
+        "one missed check isnt the end", "keep the exit direction in mind", "is that computer safely reachable?", "finishing together can save time", "watch for a beast doubling back",
+        "the progress bar loves suspense", "which computer is safest right now?", "keep the area around you readable", "good awareness keeps the hack safer", "dont camp a finished computer",
+    } },
+    { tag = "ftf_skillcheck", group = "ftf", triggers = { "failed hack", "missed check", "skill check", "skillcheck", "red computer", "red pc", "missed e", "failed check", "wrong timing", "mess up hack" }, replies = {
+        "one missed check happens bro", "reset your focus for the next cue", "watch the indicator instead of guessing", "that timing window takes practice", "dont panic after a mistake",
+        "keep an escape route ready now", "did lag make the input late?", "one error doesnt define your round", "try reacting to the actual cue", "the next check is a fresh chance",
+        "dont mash through the timing", "keep your camera aware too", "was that a sudden delay?", "small practice sessions help timing", "check the game prompt for the key",
+        "that alert makes awareness extra important", "you can recover from a missed check", "take one calm breath first", "is the beast heading over?", "the timing gets easier with repetition",
+        "dont let one miss snowball", "watch for the next indicator", "keep nearby doors in mind", "was the cue hard to see?", "that was an unfortunate little slip",
+        "practice accuracy before trying speed", "stay aware of the room entrances", "one clean check resets the vibe", "did your fps drop then?", "the skill check wants your attention",
+        "avoid pressing before the cue arrives", "give yourself a steady rhythm", "watch the room after an alert", "youve still got the rest of the round", "was it early or late?",
+        "misses are useful practice notes", "dont rush the next one from frustration", "let the indicator guide the input", "keep your escape options open", "did the game freeze briefly?",
+        "you can improve that timing gradually", "one cue at a time", "an alert means reassess your route", "dont blame yourself for connection delays", "was the key prompt different?",
+        "the next attempt can be cleaner", "keep the squad informed if needed", "practice without chasing perfect streaks", "stay calm if the beast approaches", "the missed check isnt your whole match",
+    } },
+    { tag = "ftf_beast", group = "ftf", triggers = { "beast", "hammer", "beast nearby", "heartbeat", "hunter", "beast strong", "beast fast", "beast role", "im beast", "as beast" }, replies = {
+        "watch where the beast is heading", "keep another route ready", "which way did the beast go?", "dont give up your escape space", "the heartbeat warning matters",
+        "use turns to break a predictable route", "is the beast staying near a pod?", "avoid running into a closed doorway", "map knowledge helps both roles", "watch for a sudden direction change",
+        "that beast sounds pretty alert", "keep the closest safe window in mind", "did the beast double back?", "dont assume the chase is over", "as beast watch likely escape routes",
+        "survivors may loop through open rooms", "is that beast guarding the exit?", "stay calm and read the movement", "keep cover between you when possible", "which room has another way out?",
+        "good timing matters around corners", "dont follow the same loop forever", "that warning means reassess quickly", "keep a little room to turn", "did the beast spot your route?",
+        "beast pressure can change rescue timing", "watch the doors ahead not just behind", "use routes you actually know", "is the next window clear?", "the beast can predict repeated patterns",
+        "dont get trapped in a tiny room", "look for connecting rooms early", "which side has safer space?", "as beast listen and watch carefully", "survivors need more than raw speed",
+        "keep a backup route before committing", "did the warning get stronger?", "avoid crowding the same corner", "that chase needs a calm route choice", "watch for an exit camper",
+        "is the beast distracted elsewhere?", "dont run blindly toward teammates", "good turns can buy breathing room", "keep the room layout in mind", "which direction feels less crowded?",
+        "one doorway can change the chase", "watch the beast without losing your path", "as beast dont ignore other rooms", "is there a safe route around?", "keep the warning in your awareness",
+    } },
+    { tag = "ftf_chase", group = "ftf", triggers = { "chase", "chasing me", "running away", "escape beast", "being chased", "beast chasing", "run away", "window", "vault", "double jump", "jump" }, replies = {
+        "look for an open connecting route", "turn before the path dead ends", "is the next doorway open?", "keep your camera reading the route", "dont run the same straight line forever",
+        "windows can connect useful escape paths", "check the landing before jumping", "do you have room to turn?", "use routes you know well", "dont aim blindly at a closed door",
+        "that chase sounds intense", "keep the next corner in mind", "is there another room ahead?", "read the beast position before turning", "avoid getting boxed into a corner",
+        "practice the games jump timing", "dont rely on jumps without clear space", "is the window route actually open?", "keep a safe landing in view", "an early turn can beat panic",
+        "you need an exit from that room", "dont lose the forward route watching behind", "can you reach an open doorway?", "switch routes if the loop gets predictable", "use the game prompts for movement",
+        "keep the next landing supported", "dont jump into a low ceiling", "is the beast blocking the short route?", "read ahead instead of reacting late", "stay calm through the next turn",
+        "avoid rooms with only one way out", "open routes give you more choices", "can a nearby window help?", "dont land in the beasts path", "one clean turn can buy time",
+        "keep your view on the doorway frame", "practice double jump timing if supported", "is the landing area safe?", "dont commit to a blind drop", "turning options matter more than panic",
+        "keep enough space to change direction", "dont keep pressing into the same wall", "can you switch to another hallway?", "use the map instead of guessing", "watch for the beast cutting across",
+        "keep the chase route readable", "dont jump just because youre worried", "is there an open route behind cover?", "take the safe opening when available", "your next turn needs a real path",
+    } },
+    { tag = "ftf_captured", group = "ftf", triggers = { "captured", "caught", "in a pod", "in pod", "im in pod", "frozen", "freeze pod", "freeze tube", "got hit", "ragdoll", "knocked down" }, replies = {
+        "tell the squad which pod youre in", "hope a free teammate can help", "is the beast staying nearby?", "let your teammates know the location", "im chat only cant rescue you",
+        "watch whether the beast moves away", "that capture is rough bro", "can a teammate reach your room?", "keep the team informed calmly", "dont blame yourself for one hit",
+        "which pod room are you in?", "a safe rescue needs good timing", "hope your team has a clear route", "is anyone free nearby?", "the squad needs your pod location",
+        "that round still has a chance", "tell them if the beast is camping", "can someone approach from another side?", "im here to chat through the wait", "hope a teammate spots your message",
+        "which map is this happening on?", "one capture doesnt mean youre hopeless", "clear callouts help rescuers decide", "is the path to your pod guarded?", "give the team a calm update",
+        "that pod has terrible hospitality", "hope your rescue window opens soon", "can you see the beast leave?", "teammates need the room not just help", "the round isnt over yet",
+        "which side can teammates approach from?", "hope the squad stays aware", "tell them about nearby closed doors", "is the beast watching the entrance?", "im not moving the character here",
+        "that capture deserves a comeback later", "helpful details beat repeated panic", "can another survivor distract the beast?", "let the free teammate choose timing", "hope a safe opening appears",
+        "which teammate is still free?", "being caught happens during learning", "tell the squad when danger shifts", "is there a second route to you?", "stay patient while they plan",
+        "the pod needs a better review score", "hope your team sees that callout", "can they reach the other doorway?", "dont lose hope from one mistake", "clear location details can help",
+    } },
+    { tag = "ftf_rescue", group = "ftf", triggers = { "rescue", "save me", "help me", "save teammate", "save them", "unfreeze", "free me", "help pod", "silent help", "press e", "rescue failed" }, replies = {
+        "ask a free teammate for rescue", "check the beast before approaching", "is the pod route clear?", "use the games interaction prompt nearby", "im a chat bot not a rescuer",
+        "tell the team the pod room", "dont rush into a guarded entrance", "can you approach from another side?", "safe timing matters for rescues", "watch the beast leave before committing",
+        "is a teammate already heading there?", "keep an escape route after rescue", "dont let everyone get caught together", "use the visible interaction key", "which door leads to that pod?",
+        "tell the squad about a camping beast", "look for a shorter reachable route", "dont keep pushing into the wall", "is there an open doorway nearby?", "team callouts make rescues easier",
+        "give the freed teammate room to leave", "check whether the pod is still occupied", "dont assume a rescue input registered", "can you see the interaction prompt?", "keep the approach safe and supported",
+        "im only providing chat advice", "warn the team if the beast returns", "try the actual game prompt at contact", "is the entrance being guarded?", "one safe rescue can change the round",
+        "coordinate instead of all rushing together", "check the nearest usable door", "dont trap yourselves beside the pod", "can a teammate cover the escape route?", "watch the pod occupant after interacting",
+        "the rescue needs both timing and access", "tell them which room needs help", "use another entrance if the first is blocked", "is the beast distracted now?", "dont promise a rescue you cant reach",
+        "keep the rescued teammate informed", "look for a safe interaction position", "dont ignore another survivor being chased", "can you retreat if danger returns?", "the shortest line may cross a wall",
+        "ask a free player to help you", "check that the door really opened", "clear callouts beat repeated help spam", "is the rescue route still available?", "good teamwork means getting out safely too",
+    } },
+    { tag = "ftf_exit", group = "ftf", triggers = { "exit", "exitdoor", "exit door", "door open", "door opened", "escape door", "door camper", "exit camping", "exit open", "door closed" }, replies = {
+        "check if the exit is actually open", "watch for the beast near the doorway", "is there another safer exit?", "the escape area is beyond the doorway", "dont stand outside an open exit forever",
+        "follow the game prompt to open it", "keep a safe approach in mind", "is the beast guarding that exit?", "an open door needs a clear route", "dont crowd the same doorway",
+        "tell the squad which exit is safer", "check the gate before committing", "can you reach the other door?", "if youre alone dont wait outside", "watch the exit area as you enter",
+        "dont confuse unlocked with fully open", "keep your escape lane readable", "is the gate still moving?", "another exit can beat a camper", "let teammates know when it opens",
+        "dont stop at the interaction button", "the goal is entering the escape area", "can you approach without crossing danger?", "check whether teammates still need help", "an open route is worth taking",
+        "keep some space around the doorway", "watch for the beast doubling back here", "is your team near the exit?", "dont follow a blocked escape route blindly", "use the nearest safe open exit",
+        "the doorway isnt the whole escape", "check both sides of the approach", "can you get into the escape zone?", "tell others if that exit is guarded", "dont wait in the beasts clear path",
+        "an unlocked exit may still need opening", "keep another exit option in mind", "is that door open enough to pass?", "solo escape doesnt need a lobby meeting", "watch your route through the gate",
+        "the exit button isnt the finish line", "choose safety over the nearest distance", "can the squad use a different exit?", "dont run straight into an exit camper", "enter the escape area when safe",
+        "keep the gate state in view", "an open exit is a chance not a guarantee", "is there a clear path beyond it?", "tell the team before switching exits", "safe passage matters more than door hype",
+    } },
+    { tag = "ftf_solo", group = "ftf", triggers = { "last survivor", "last one", "only me", "alone", "solo", "one survivor", "everyone left", "all captured", "just me", "last alive" }, replies = {
+        "youre alone keep the route simple", "check for a safe open exit", "which computers are still unfinished?", "dont wait outside an open escape", "keep track of the beast first",
+        "solo rounds need extra awareness", "is there a reachable teammate to free?", "dont run into a guarded dead end", "map knowledge matters even more now", "you still have choices to evaluate",
+        "which exit looks safer?", "keep a backup route ready", "dont panic because youre the last one", "watch the next doorway carefully", "is the beast staying near you?",
+        "solo pressure can make timing harder", "take the safe opening when it appears", "dont stand waiting for absent teammates", "can you reach the escape area now?", "one calm decision at a time",
+        "which room gives you a second exit?", "keep your camera reading ahead", "dont force a risky rescue blindly", "check the live round state", "is the exit already unlocked?",
+        "solo doesnt mean automatic defeat", "look for the least guarded route", "dont camp a completed computer", "can you use another exit?", "keep your escape direction in mind",
+        "which teammate could still be saved?", "watch for the beast cutting you off", "dont let the pressure choose every turn", "safe progress beats a desperate sprint", "is your next route actually open?",
+        "the final survivor needs breathing room", "enter a safe open exit promptly", "dont wait for a team that left", "can you break the predictable loop?", "you can still learn from this round",
+        "which path gives you more options?", "keep your route supported and clear", "dont ignore a closed door ahead", "read the map before committing", "is the beast guarding the only approach?",
+        "one good turn can change things", "look for a real escape opportunity", "dont stand at the gate once its safe", "can you finish the last computer safely?", "stay aware through the final stretch",
+    } },
+    { tag = "ftf_team", group = "ftf", triggers = { "teammate", "teammates", "team", "afk teammate", "troll", "left me", "abandoned me", "teamwork", "camping", "camper" }, replies = {
+        "clear callouts help the squad", "dont blame the whole team instantly", "is someone still free to help?", "teammates may be busy escaping too", "coordinate the route before rushing",
+        "afk players make rounds harder", "which teammate needs help first?", "keep the chat calm and useful", "give people room to learn", "different roles need different timing",
+        "is the squad using separate routes?", "dont turn a mistake into an argument", "tell them the room and danger", "good teamwork needs awareness", "can another survivor handle that rescue?",
+        "remember teammates have limited information", "clear directions beat repeated shouting", "avoid crowding one risky doorway", "is everyone heading to the same pod?", "shared progress makes the round smoother",
+        "which player is still able to move?", "dont assume someone saw your message", "keep plans short during a chase", "new players need simple explanations", "can the team split computer tasks?",
+        "one teammate mistake isnt the whole story", "use callouts that describe the situation", "avoid pulling danger toward a rescue", "is someone watching the exit route?", "friendly teams recover from bad rounds",
+        "which room is the squad covering?", "dont send everyone into one trap", "check whether a teammate is captured", "helpful chat makes decisions easier", "can someone approach from the other side?",
+        "keep the plan realistic for the map", "dont promise instant help across the map", "listen when a teammate warns you", "is the camper still watching that entrance?", "teamwork works better without blame",
+        "which objective needs attention now?", "give a teammate a clear escape lane", "dont confuse afk with ignoring you", "keep an eye on who remains", "can you share the danger location?",
+        "good callouts save guessing time", "avoid chasing arguments during a round", "help the team understand the route", "is another exit available for the squad?", "calm coordination beats panic spam",
+    } },
+    { tag = "ftf_map", group = "ftf", triggers = { "map", "maps", "airport", "facility", "homestead", "abandoned prison", "prison", "library", "school map", "map vote", "best map", "hardest map" }, replies = {
+        "which map are you playing?", "learn the connecting rooms first", "windows can change the route choices", "keep the nearest doors in mind", "map familiarity takes a few rounds",
+        "which room keeps confusing you?", "look for more than one escape path", "open spaces and corners play differently", "dont assume every hallway connects", "notice the exits before pressure starts",
+        "which map do you know best?", "practice finding alternate room entrances", "short routes still need clear access", "remember where dead ends are", "maps feel easier once routes click",
+        "which section feels hardest to navigate?", "learn a safe loop before improvising", "keep track of the open doors", "stairs can change floor awareness", "different rooms need different escape plans",
+        "which map would you vote for?", "look at where windows actually land", "the nearest point may be across a wall", "remember the rooms with two exits", "map reading improves with practice",
+        "which doorway catches you out?", "dont trust a route you havent checked", "learn the exit approaches during calmer rounds", "corners need enough room to turn", "familiar routes can reduce panic",
+        "which map has your favorite layout?", "notice where the beast can cut across", "exploring helps you remember connections", "different floors can look deceptively close", "good layouts give multiple choices",
+        "which room has the awkward window?", "keep a mental route back out", "the shortest route may need a door", "learn landmarks instead of guessing turns", "map knowledge matters more than rushing",
+        "which map feels easiest to learn?", "notice safe places to change direction", "dont get boxed into a tiny room", "keep the next connection visible", "each map rewards different habits",
+        "which route worked well last round?", "practice the rooms that confuse you", "doors can change a familiar route", "learn the escape zone locations", "map preference depends on your playstyle",
+    } },
+    { tag = "ftf_victory", group = "ftf", triggers = { "gg", "ggs", "won", "we won", "i won", "escaped", "we escaped", "win", "victory", "clutch", "lets go" }, replies = {
+        "gg that was a nice finish", "clean escape good stuff", "the round ended on a high", "nice win keep it friendly", "that clutch deserves a little cheer",
+        "ggs how close was it?", "good teamwork paid off there", "nice one enjoy the moment", "that escape had great timing", "the final stretch delivered",
+        "gg which turn saved you?", "clean finish after all that pressure", "nice victory for the squad", "that comeback had good pacing", "enjoy the win without being rude",
+        "ggs what was the hardest part?", "good decisions can make the difference", "nice escape keep those lessons", "that round had a solid ending", "the teamwork deserves credit too",
+        "gg did the whole team escape?", "clean route choice at the end", "nice win that sounded close", "that clutch was worth the patience", "enjoy a quick victory breather",
+        "ggs which map was it?", "good recovery after the rough start", "nice finish under pressure", "that escape had proper suspense", "the squad earned some good vibes",
+        "gg what almost went wrong?", "clean timing when it mattered", "nice victory after a tense chase", "that comeback made the story better", "enjoy it then reset for next round",
+        "ggs any lucky moments?", "good callouts probably helped too", "nice escape that was satisfying", "that ending deserves a replay story", "the last turn made things count",
+        "gg which objective was toughest?", "clean finish no extra drama needed", "nice win keep the chat chill", "that clutch gave the round a plot", "enjoy the little achievement",
+        "ggs what would you repeat next time?", "good teamwork is a real advantage", "nice escape after the waiting game", "that victory sounds well earned", "the next round gets a fresh start",
+    } },
+    { tag = "ftf_defeat", group = "ftf", triggers = { "lost", "we lost", "i lost", "lose", "defeat", "failed", "unlucky", "rip", "oof", "bad round", "almost won" }, replies = {
+        "rough round next one resets", "that loss doesnt erase your progress", "what went wrong at the end?", "unlucky timing happens sometimes", "take a breather before the next round",
+        "one match isnt your whole skill", "was the route blocked?", "you can learn from that finish", "dont turn one loss into self blame", "the next round is another chance",
+        "rough ending but useful experience", "that sounded frustrating bro", "what would you try differently?", "unlucky rounds make good stories later", "take the lesson not the shame",
+        "one mistake doesnt define you", "was it the beast or the map?", "you still had some good moments", "dont rush the next round in anger", "the next attempt can be calmer",
+        "rough luck on that final stretch", "that defeat isnt permanent", "what almost worked there?", "unlucky doesnt always mean bad play", "take a short break if needed",
+        "one round can teach a lot", "was the exit guarded?", "you can practice that tricky section", "dont judge yourself by one result", "the next game starts fresh",
+        "rough finish after all that effort", "that loss can still teach timing", "what caught you by surprise?", "unlucky moments happen to good players", "take a calm reset first",
+        "one close loss shows progress too", "was a teammate still available?", "you can improve the route next time", "dont chase the last mistake all day", "the next round has new possibilities",
+        "rough ending lets keep it kind", "that wasnt the only way it could go", "what part needs more practice?", "unlucky timing isnt a personality trait", "take a moment to relax",
+        "one loss doesnt cancel good teamwork", "was lag part of it?", "you still get another attempt", "dont let the result ruin the fun", "the next round deserves a fresh mood",
+    } },
+    { tag = "food", group = "life", triggers = { "food", "hungry", "eat", "eating", "snack", "pizza", "burger", "noodles", "rice", "breakfast", "lunch", "dinner", "drink", "water", "tea", "coffee" }, replies = {
+        "snack talk is my specialty", "what are you eating?", "pizza crust deserves more respect", "noodles are a strong comfort pick", "dont let gaming replace meals",
+        "whats your favorite snack?", "crispy fries have excellent vibes", "rice can carry a whole meal", "water break sounds sensible", "which topping wins your vote?",
+        "breakfast deserves some attention too", "warm soup sounds cozy", "whats the meal plan today?", "a simple sandwich can be elite", "take your food break comfortably",
+        "sweet or savory snacks?", "burgers need a reliable bun", "fruit is a nice snack option", "tea has calm lobby energy", "what drink goes with that?",
+        "snack rankings can get dramatic", "toast is quietly dependable", "whats your comfort food?", "noodles are hard to argue against", "enjoy your meal before the next round",
+        "crunchy snacks or soft snacks?", "a good sauce changes everything", "rice bowls have endless possibilities", "keep a drink nearby if you want", "which breakfast would you choose?",
+        "food debates are serious lobby business", "soup feels like a rainy day pick", "whats the best pizza topping?", "a warm meal can improve a break", "dont rush eating for a game",
+        "salty snacks or sweet treats?", "sandwiches deserve a tier list", "fruit can be pretty refreshing", "coffee talk always starts opinions", "what would you cook right now?",
+        "snack time has excellent timing", "toast needs a good topping", "whats your favorite noodle dish?", "a simple meal can still slap", "enjoy the break and the food",
+        "hot drinks or cold drinks?", "good fries need good crunch", "rice is a solid everyday choice", "water is an easy drink option", "which snack survives your tier list?",
+    } },
+    { tag = "sleep", group = "life", triggers = { "sleepy", "tired", "sleep", "bed", "late night", "all night", "sleep schedule", "insomnia", "yawn", "wake up", "woke up" }, replies = {
+        "rest sounds like a good idea", "how late is it for you?", "the game will still be here", "take a break if youre fading", "cozy blanket hours have arrived",
+        "you dont need one more round", "did you get enough rest?", "sleepy gaming has funny timing", "let your eyes rest a bit", "tomorrow can handle the next match",
+        "rest beats forcing another session", "is it time to log off?", "the lobby isnt going anywhere", "take your tiredness seriously", "cozy downtime sounds pretty nice",
+        "you can come back refreshed", "was today a long one?", "sleepy fingers miss more cues", "give yourself a quiet break", "the next round can wait",
+        "rest is allowed without excuses", "how much energy do you have?", "the screen can take a break too", "take it easy tonight", "cozy pillow wins this matchup",
+        "you dont owe the lobby overtime", "did school keep you busy?", "sleepy vibes deserve some patience", "let the keyboard cool down", "tomorrow is a fresh chance",
+        "resting isnt losing a game", "is your brain asking for a pause?", "the next win isnt urgent", "take a calm moment away", "cozy music might suit the break",
+        "you can stop while its still fun", "was the day exhausting?", "sleepy rounds get unpredictable", "give yourself permission to log off", "the lobby can manage without overtime",
+        "rest comes before perfect streaks", "how late did you stay up?", "the game doesnt need your whole night", "take a comfortable break now", "cozy bedtime sounds reasonable",
+        "you dont have to push through", "did you have a busy morning?", "sleepy gaming isnt a required challenge", "let yourself recharge in peace", "tomorrow has more lobby time",
+    } },
+    { tag = "school", group = "life", triggers = { "school", "homework", "exam", "test", "study", "studying", "class", "classes", "teacher", "assignment", "college", "lesson" }, replies = {
+        "hope your studying goes smoothly", "what subject are you working on?", "small focused breaks can help", "one task at a time bro", "schoolwork deserves time away from gaming",
+        "which topic feels confusing?", "practice usually beats last minute panic", "keep your study plan realistic", "take a short pause if needed", "what part are you reviewing?",
+        "hope the assignment makes sense soon", "clear notes can make reviewing easier", "is it a big project?", "one manageable step is enough to start", "gaming can wait during study time",
+        "which subject do you enjoy most?", "practice questions can show weak spots", "keep the instructions in view", "take your time with the basics", "what idea are you trying to understand?",
+        "hope class went alright today", "organizing the task can reduce confusion", "is the deadline close?", "one little study session still counts", "school breaks need actual rest too",
+        "which lesson was interesting today?", "practice explaining the idea simply", "keep distractions low while focusing", "take a breather after the task", "what topic needs another explanation?",
+        "hope your project comes together", "clear examples can help things click", "is it individual or group work?", "one problem at a time works", "gaming shouldnt eat every study break",
+        "which part have you understood already?", "practice helps you spot patterns", "keep the goal small and clear", "take time to read the question", "what subject do you want to discuss?",
+        "hope the lesson gets easier", "organizing notes beats guessing wildly", "is the assignment nearly finished?", "one finished section is progress", "school talk can stay general here",
+        "which concept seems most useful?", "practice with honest work pays off", "keep checking the actual task requirements", "take pride in learning something new", "what topic would you explain to a friend?",
+    } },
+    { tag = "pets", group = "life", triggers = { "pet", "pets", "cat", "cats", "dog", "dogs", "puppy", "kitten", "hamster", "bunny", "rabbit", "animal", "animals" }, replies = {
+        "pet stories are always welcome", "what kind of pet do you like?", "cats have dramatic timing", "dogs bring a lot of energy", "tiny paws have powerful vibes",
+        "whats the funniest thing it does?", "sleepy pets are peak cozy", "pet names can be really creative", "animals deserve gentle treatment", "does it have a favorite toy?",
+        "that sounds like a cute companion", "curious cats find every cardboard box", "what animal would you choose?", "playful dogs can brighten a day", "cozy nap spots get serious reviews",
+        "whats its favorite little habit?", "small pets still have big personalities", "pet care takes real responsibility", "animals need space and kindness", "does it like sitting nearby?",
+        "that pet story made chat nicer", "cats can be tiny comedians", "what do you like about that animal?", "dogs can be wonderfully curious", "little paws deserve a slow approach",
+        "whats the silliest moment so far?", "sleeping pets look so peaceful", "pet toys dont need dramatic budgets", "animals arent just cute accessories", "does it like chasing toys?",
+        "that sounds like a fun pet moment", "cats have excellent box loyalty", "which animal fact surprised you?", "dogs make walks more interesting", "cozy blankets attract tiny guests",
+        "whats its funniest expression?", "small animals can be very curious", "pet routines need consistency", "animals deserve care beyond photos", "does it have a comfy spot?",
+        "that companion sounds pretty sweet", "cats manage dramatic entrances well", "what pet story would you tell first?", "dogs can turn walks into adventures", "little paws have memorable personalities",
+        "whats its most surprising habit?", "sleepy animals bring calm vibes", "pet photos dont replace actual care", "animals need patient responsible owners", "does it enjoy gentle playtime?",
+    } },
+    { tag = "music", group = "media", triggers = { "music", "song", "songs", "playlist", "listening", "headphones", "soundtrack", "band", "singer", "rap", "pop music", "lofi" }, replies = {
+        "what are you listening to?", "good music changes the whole mood", "chill playlists suit lobby breaks", "soundtracks can carry a game", "got a song recommendation?",
+        "lofi fits a quiet evening", "a catchy chorus stays forever", "instrumentals make nice background music", "what genre do you usually pick?", "good headphones reveal tiny details",
+        "music talk always brings different tastes", "calm tracks work for downtime", "whats your favorite game soundtrack?", "a strong beat can lift energy", "keep the volume comfortable",
+        "got a favorite artist lately?", "slow songs can suit rainy days", "melodies make memories stick", "what song keeps returning to your playlist?", "good sound design counts too",
+        "music preferences dont need a competition", "cozy playlists have solid timing", "whats your current repeat track?", "a simple tune can hit hard", "leave room to hear game cues",
+        "got a soundtrack you never skip?", "soft instrumentals are a nice break", "catchy rhythms are dangerous for focus", "what mood is your playlist today?", "good songs can improve a boring wait",
+        "music discovery is a fun rabbit hole", "calm background tracks keep things cozy", "whats the best lobby music youve heard?", "a memorable melody does a lot", "comfortable volume is enough",
+        "got any underrated music picks?", "slow piano can sound really peaceful", "drums can change a tracks energy", "what song reminds you of a game?", "good audio deserves more appreciation",
+        "music tastes can be totally different", "cozy tracks beat awkward silence", "whats your favorite instrumental piece?", "a great chorus earns a replay", "keep your hearing in mind",
+        "got a favorite playlist theme?", "soft background music suits a break", "rhythm games need good timing", "what would you put on next?", "good soundtracks make worlds memorable",
+    } },
+    { tag = "movies", group = "media", triggers = { "movie", "movies", "film", "anime", "show", "series", "youtube", "streamer", "video", "meme", "cartoon", "episode" }, replies = {
+        "what are you watching lately?", "a good story needs a hook", "funny clips make nice breaks", "animation can be incredibly creative", "got a show recommendation?",
+        "memorable characters carry a lot", "a clever ending changes everything", "short videos can still tell stories", "what genre do you enjoy?", "good pacing matters more than length",
+        "movie debates can get intense", "cozy shows suit quiet evenings", "whats your favorite character type?", "a nice soundtrack helps the scene", "avoid spoiling the big reveal",
+        "got a favorite funny clip?", "creative animation deserves credit", "simple stories can be really effective", "what makes that show stand out?", "good editing can make a joke land",
+        "media tastes dont need arguing over", "funny moments deserve a tiny replay", "whats the best part of that series?", "a good villain needs clear motives", "keep spoilers clearly warned",
+        "got any underrated viewing picks?", "cozy cartoons can be surprisingly clever", "small details reward another watch", "what kind of ending do you prefer?", "good dialogue makes characters memorable",
+        "movie nights need a snack ranking", "funny edits have excellent timing", "whats the latest episode like?", "a strong first scene gets attention", "dont spoil it for new viewers",
+        "got a favorite harmless meme?", "creative visuals can carry atmosphere", "short stories dont need filler", "what character deserves more screen time?", "good music can elevate a scene",
+        "media talk brings interesting opinions", "cozy viewing beats endless scrolling", "whats your comfort show?", "a plot twist needs setup", "keep the spoilers off the table",
+        "got a favorite animation style?", "funny scenes can save a slow episode", "small background jokes are underrated", "what would you recommend first?", "good endings make people keep talking",
+    } },
+    { tag = "boredom", group = "emotion", triggers = { "bored", "boring", "nothing to do", "chat dead", "so quiet", "im bored", "silent chat", "entertain me", "talk to me", "say something" }, replies = {
+        "want a tiny trivia question?", "lets rank imaginary lobby snacks", "got a weird game opinion?", "we can talk about favorite maps", "what would make this round funnier?",
+        "pick cats or dogs", "lets hear your hottest harmless take", "got a funny round story?", "we can try a quick riddle", "what game would you invent?",
+        "pick pizza or noodles", "lets compare cozy game vibes", "got an oddly specific favorite thing?", "we can discuss the best soundtrack", "what map needs a redesign?",
+        "pick rainy days or sunny days", "lets make a tiny tier list", "got a question for tom?", "we can chat while the lobby waits", "what would your dream game include?",
+        "pick mountains or beaches", "lets debate the best breakfast", "got a silly what if question?", "we can swap game recommendations", "what skill would you learn first?",
+        "pick funny stories or trivia", "lets hear a random safe opinion", "got a silly harmless meme to share?", "we can invent a lobby nickname", "what would your avatar theme be?",
+        "pick soup or sandwiches", "lets rank fictional game menus", "got a cool animal fact?", "we can compare favorite game genres", "what makes a map memorable?",
+        "pick calm games or tense games", "lets discuss a tiny mystery", "got a topic we havent tried?", "we can make up a harmless challenge", "what snack belongs in first place?",
+        "pick space games or ocean games", "lets hear your best small joke", "got a movie recommendation?", "we can do an easy word game", "what game sound do you remember most?",
+        "pick morning games or evening games", "lets build an imaginary cozy room", "got a surprising game moment?", "we can discuss something completely random", "what would you name a pet dragon?",
+    } },
+    { tag = "sadness", group = "emotion", triggers = { "sad", "upset", "lonely", "bad day", "rough day", "unhappy", "feeling down", "stressed", "worried", "anxious", "not good" }, replies = {
+        "sorry today feels rough", "want to talk about it generally?", "you dont have to force cheerfulness", "a short break is okay", "hope the next moment feels gentler",
+        "im here for a little chat", "what would feel comforting right now?", "you deserve some patience today", "one bad day isnt your whole life", "try reaching someone you trust",
+        "sorry things feel heavy rn", "want a lighter topic for a bit?", "you dont need to explain everything", "take the conversation at your pace", "hope you get a calm moment soon",
+        "im happy to keep you company", "what usually helps you unwind?", "you dont have to act fine here", "one rough round doesnt define you", "a trusted person can listen too",
+        "sorry the day didnt go well", "want to vent without private details?", "you can take a quiet pause", "a little rest is allowed", "hope tomorrow treats you more kindly",
+        "im around for a gentle chat", "what would make the break easier?", "you deserve kindness even on bad days", "one setback doesnt erase good things", "talking to someone trusted can help",
+        "sorry youre having that kind of day", "want a small distraction instead?", "you dont owe anyone instant positivity", "take some space if you need", "hope something nice finds you today",
+        "im here to talk casually", "what feels manageable right now?", "you can be honest about feeling tired", "one mistake isnt all of you", "trusted friends can offer real support",
+        "sorry its been difficult lately", "want to change the subject gently?", "you dont need perfect words", "a calm break can be worthwhile", "hope you get some breathing room",
+        "im happy to listen in chat", "what would you rather discuss now?", "you deserve a little gentleness", "one hard moment isnt forever", "reach out to someone trustworthy if needed",
+    } },
+    { tag = "frustration", group = "emotion", triggers = { "angry", "mad", "annoyed", "frustrated", "rage", "raging", "so unfair", "unfair", "hate this", "tilted" }, replies = {
+        "that sounds frustrating bro", "take a pause before the next round", "what made it feel unfair?", "dont let anger choose every input", "you can step away briefly",
+        "one annoying moment needs a reset", "was it timing or lag?", "keep the chat calm if possible", "a rough round doesnt need an argument", "give yourself a little breathing room",
+        "that would test anyones patience", "take a calm second first", "what part annoyed you most?", "dont turn the frustration on teammates", "you dont have to queue instantly",
+        "one bad call isnt the whole game", "was the route unexpectedly blocked?", "keep the next decision simple", "an argument wont fix the round", "let the keyboard rest for a moment",
+        "that sounds like a rough finish", "take the useful lesson from it", "what would you change next time?", "dont rush just to prove something", "you can return after cooling off",
+        "one unfair feeling doesnt need a spiral", "was someone ignoring the plan?", "keep criticism about the actual play", "a short break can protect the fun", "give yourself time before replying",
+        "that situation sounds pretty annoying", "take a breath before typing back", "what surprised you there?", "dont make the next round a revenge mission", "you can switch servers if needed",
+        "one frustrating match is still one match", "was the game behaving strangely?", "keep your words kinder than your mood", "a calm reset beats chat drama", "let the frustration settle a little",
+        "that timing would annoy me too", "take things one decision at a time", "what caused the sudden mood change?", "dont let a bad moment ruin the evening", "you can stop without proving anything",
+        "one mistake doesnt need a whole debate", "was it a repeat problem?", "keep the team callouts useful", "a quieter break might be better", "give the next round a fresh start",
+    } },
+    { tag = "excitement", group = "emotion", triggers = { "excited", "happy", "hyped", "great day", "good day", "birthday", "celebrate", "celebration", "amazing", "cant wait", "best day" }, replies = {
+        "love that happy energy", "what made today feel good?", "enjoy the little win", "that sounds like a nice moment", "good vibes deserve some space",
+        "whats the exciting news?", "hope the celebration feels fun", "you earned a little cheer", "keep that positive momentum", "what part are you looking forward to?",
+        "love seeing the chat brighten", "whats the reason for the hype?", "enjoy it without rushing ahead", "that sounds pretty wholesome", "good moments are worth noticing",
+        "whats your favorite part so far?", "hope the day keeps treating you well", "you brought cheerful lobby energy", "keep the celebration friendly", "what would make it even better?",
+        "love the little happiness update", "whats got you smiling today?", "enjoy the moment while it lasts", "that sounds like a solid day", "good news makes chat nicer",
+        "whats the plan for celebrating?", "hope its a memorable birthday", "you deserve a kind little cheer", "keep those good vibes going", "what are you most excited about?",
+        "love a wholesome chat moment", "whats the highlight of your day?", "enjoy the good mood comfortably", "that sounds like fun anticipation", "good memories start with little moments",
+        "whats happening next?", "hope the celebration goes smoothly", "youve got some bright energy today", "keep making room for the fun", "what would you tell us first?",
+        "love that optimistic mood", "whats the nicest surprise today?", "enjoy the happy little details", "that sounds like a great break", "good energy can improve a lobby",
+        "whats making the wait exciting?", "hope your birthday has cozy moments", "you brought the positive plot twist", "keep the hype kind to everyone", "what moment deserves a tiny trophy?",
+    } },
+    { tag = "knowledge", group = "knowledge", triggers = { "fun fact", "random fact", "trivia", "science", "animal fact", "space fact", "teach me", "tell me a fact", "riddle", "quick math" }, replies = {
+        "octopuses have three hearts", "bats are mammals", "whales are mammals", "penguins are birds", "the sun is a star",
+        "the moon reflects sunlight", "earth orbits the sun", "water freezes at zero celsius normally", "sound needs matter to travel", "light travels faster than sound",
+        "plants use sunlight for photosynthesis", "bees help pollinate many plants", "spiders have eight legs", "insects have six legs", "adult humans usually have thirty two teeth",
+        "earth has one natural moon", "mars is called the red planet", "jupiter is our largest planet", "venus is hotter than mercury on average", "saturn has prominent rings",
+        "the pacific is earths largest ocean", "tokyo is japans capital", "paris is frances capital", "hanoi is vietnams capital", "canberra is australias capital",
+        "ottawa is canadas capital", "triangles have three sides", "hexagons have six sides", "a right angle measures ninety degrees", "an hour contains sixty minutes",
+        "gravity keeps planets in orbit", "earth rotates about once a day", "air scatters blue light strongly", "rainbows form when water bends light", "echoes are reflected sound",
+        "ice is less dense than liquid water", "whale sharks are fish", "corals are animals", "platypuses are mammals that lay eggs", "seahorse fathers carry the developing young",
+        "the heart pumps blood", "leaves can release water vapor", "opposite magnetic poles attract", "electric current is moving charge", "the result is {answer}",
+        "that equals {answer}", "your answer is {answer}", "the calculation gives {answer}", "that works out to {answer}", "its {answer} for that expression",
+    } },
+    { tag = "clarify", group = "random", triggers = { "what", "why", "how", "question", "huh", "what do you mean", "dont understand", "explain", "idk", "unknown" }, replies = {
+        "what part do you mean?", "can you add a little context?", "which thing are you asking about?", "say a bit more bro", "what happened just before that?",
+        "can you reword that simply?", "which part should we discuss?", "tell me the topic first", "what are you referring to?", "can you give a short example?",
+        "which game situation do you mean?", "im not sure i understood", "what would you like explained?", "can you spell that another way?", "which idea are we talking about?",
+        "give me one more detail", "what does that refer to here?", "can you put it differently?", "which bit needs more context?", "im listening whats the context?",
+        "what happened in the round?", "can you name the thing?", "which message are you replying to?", "tell me a little more", "what question did you have?",
+        "can you make that more specific?", "which topic should i start with?", "im not certain what you mean", "what are you trying to figure out?", "can you describe it briefly?",
+        "which part needs another explanation?", "give me the short version", "what was the main point?", "can you explain the situation?", "which detail matters most here?",
+        "im here whats your question?", "what do you want to know first?", "can you use a few more words?", "which game are you talking about?", "tell me what happened next",
+        "what did you mean by that?", "can you point to the topic?", "which choice are you comparing?", "im not sure about that yet", "what answer are you looking for?",
+        "can you add one example?", "which part did i miss?", "give me a clearer hint", "what should we focus on?", "can you ask that another way?",
+    } },
+    { tag = "story", group = "story", triggers = { "story", "tell me a story", "story time", "storytime", "guess what", "something happened", "tell you something", "no way", "listen to this" }, replies = {
+        "imagine a lobby where chairs vote", "imagine a sandwich winning the map vote", "imagine a loading bar taking lunch", "imagine a door asking for directions", "imagine a computer requesting a nap",
+        "imagine a tiny dragon guarding snacks", "imagine a hallway changing its mind", "imagine a lobby cloud wearing slippers", "imagine a pancake becoming team captain", "imagine a window hosting a talent show",
+        "picture a backpack full of noodles", "picture a cat judging avatar outfits", "picture a penguin running the lobby", "picture a snack ranking causing suspense", "picture a map with polite doorbells",
+        "picture a robot collecting cozy blankets", "picture a keyboard writing its own excuse", "picture a toaster starting a game club", "picture a hallway full of rubber ducks", "picture a sleepy dragon choosing tea",
+        "suppose the lobby music chose the map", "suppose every doorway wanted a compliment", "suppose the loading screen told jokes", "suppose the snack table had a leaderboard", "suppose a tiny cloud joined the squad",
+        "what was the next twist?", "that sounds like a funny setup", "how did the round end?", "what happened after the surprise?", "that story needs the next chapter",
+        "who noticed the mistake first?", "what made that moment memorable?", "that sounds unexpectedly dramatic", "how close was the final attempt?", "what was the funniest detail?",
+        "that sounds like a lobby adventure", "who had the best reaction?", "what part caught everyone off guard?", "that ending needs a little context", "how did you find the way out?",
+        "what happened to the original plan?", "that sounds worth a short recap", "who changed the whole situation?", "what would you do differently now?", "that story has some real suspense",
+        "how did the teammate react?", "what was the biggest plot twist?", "that sounds like a memorable round", "who got the last laugh there?", "what part would you tell again?",
+    } },
+}
+
+-- Pure matching/queue engine: no Roblox movement, remote hacks or API calls.
+local Engine = {}
+Engine.__index = Engine
+
+local function normalize(text)
+    return tostring(text or ""):lower():gsub("’", ""):gsub("'", ""):gsub("[^%w%s]", " "):gsub("%s+", " "):match("^%s*(.-)%s*$")
+end
+
+local function contains(text, phrase)
+    return (" " .. text .. " "):find(" " .. phrase .. " ", 1, true) ~= nil
+end
+
+local function safeName(value)
+    return tostring(value or ""):gsub("[%c]", ""):sub(1, 80):lower()
+end
+
+local function validReply(text)
+    if type(text) ~= "string" or text == "" or #text > 190 then return false end
+    if text ~= text:lower() or text:find("[.!,:;]$") then return false end
+    if contains(normalize(text), "on it") or text:find("http", 1, true) or text:find("@", 1, true) then return false end
+    if text:find("%d%d%d%d%d%d") or text:find("[%c{}]") then return false end
+    local words = 0
+    for _ in text:gmatch("%S+") do words += 1 end
+    return words <= 12
+end
+
+function Engine.new(settings, clock, random)
+    local self = setmetatable({}, Engine)
+    self.Config = table.clone(settings)
+    self.Clock, self.Random = clock or os.clock, random or math.random
+    self.Enabled, self.Destroyed, self.Sending, self.Epoch = false, false, false, 0
+    self.Pending, self.NextSend = nil, 0
+    self.LastInbound, self.LastOutbound = self.Clock(), -math.huge
+    self.Sessions, self.Seen, self.MessageIds = {}, {}, {}
+    self.Recent, self.RecentSet, self.Used = {}, {}, {}
+    self.Topics, self.Index, self.LastError = {}, {}, nil
+    self.SentCount, self.DroppedCount, self.FailedCount = 0, 0, 0
+    for _, topic in ipairs(Bank) do
+        self.Topics[topic.tag] = topic
+        for _, trigger in ipairs(topic.triggers) do
+            local phrase = normalize(trigger)
+            if phrase ~= "" then
+                local rows = self.Index[phrase]
+                if not rows then rows = {}; self.Index[phrase] = rows end
+                rows[#rows + 1] = topic
+            end
+        end
+    end
+    return self
+end
+
+function Engine:setEnabled(value)
+    if self.Destroyed then return end
+    self.Enabled = value == true
+    self.Epoch += 1
+    self.Pending = nil
+    self.LastInbound = self.Clock()
+    if self.Enabled then self.NextSend = math.max(self.NextSend, self.Clock() + 0.2) end
+end
+
+function Engine:destroy()
+    self.Destroyed, self.Enabled = true, false
+    self.Epoch += 1
+    self.Pending = nil
+    table.clear(self.Sessions)
+    table.clear(self.Seen)
+    table.clear(self.MessageIds)
+end
+
+function Engine:addressed(text, owner)
+    for _, alias in ipairs({ "tom", "tommy", normalize(owner.name), normalize(owner.display) }) do
+        if alias ~= "" and contains(text, alias) then return true end
+    end
+    return false
+end
+
+function Engine:receive(speaker, raw, feed, messageId, owner)
+    if self.Destroyed then return false end
+    self.LastInbound = self.Clock()
+    if not self.Enabled or not speaker or speaker.id == owner.id then return false end
+    local text = tostring(raw or ""):sub(1, self.Config.MaxInputLength)
+    local clean = normalize(text)
+    if clean == "" then clean = "unclear message" end
+    local now, key = self.Clock(), tostring(speaker.id) .. ":" .. clean
+    if messageId and messageId ~= "" and self.MessageIds[messageId] then return false end
+    if messageId and messageId ~= "" then self.MessageIds[messageId] = now end
+    local previous = self.Seen[key]
+    if previous and previous.feed ~= feed and now - previous.at < 1.5 then return false end
+    self.Seen[key] = { at = now, feed = feed }
+    local priority = self:addressed(clean, owner) and 3 or 0
+    if priority < 3 and text:find("?", 1, true) then priority = 2 end
+    if priority < 2 then
+        local first = clean:match("^%w+")
+        if first == "what" or first == "why" or first == "how" or first == "where" or first == "who" then priority = 2 end
+    end
+    local pending = self.Pending
+    if pending and now - pending.at <= self.Config.StaleAfter and pending.priority > priority then
+        self.DroppedCount += 1
+        return false
+    end
+    if pending then self.DroppedCount += 1 end
+    self.Pending = {
+        speaker = speaker, raw = text, clean = clean, at = now,
+        readyAt = now + self.Config.ReplyDelay, priority = priority,
+        epoch = self.Epoch, attempts = 0,
+    }
+    return true
+end
+
+function Engine:topicFor(text)
+    local words, votes, best, score = {}, {}, nil, -1
+    for word in text:gmatch("%S+") do words[#words + 1] = word end
+    -- At most 6-word phrases from one bounded message; never scan 2,000 lines.
+    for i = 1, #words do
+        local phrase = ""
+        for j = i, math.min(#words, i + 5) do
+            phrase = phrase == "" and words[j] or phrase .. " " .. words[j]
+            for _, topic in ipairs(self.Index[phrase] or {}) do
+                local weight = (j - i + 1) * 8 + math.min(#phrase, 30) * 0.1
+                if topic.tag == "clarify" then weight = weight * 0.15 end
+                votes[topic] = (votes[topic] or 0) + weight
+            end
+        end
+    end
+    -- Stable bank order resolves ties instead of hash-table traversal order.
+    for _, topic in ipairs(Bank) do
+        local value = votes[topic]
+        if value and value > score then best, score = topic, value end
+    end
+    return best
+end
+
+function Engine:mathAnswer(raw, owner)
+    local text = tostring(raw):lower():gsub("’", ""):gsub("'", ""):gsub("×", "*"):gsub("÷", "/"):gsub("[?=]+%s*$", "")
+    for _, alias in ipairs({ "tommy", "tom", safeName(owner.name), safeName(owner.display) }) do
+        if alias ~= "" and text:sub(1, #alias) == alias and text:sub(#alias + 1, #alias + 1):match("[%s,:]") then
+            text = text:sub(#alias + 1):gsub("^[%s,:]+", "")
+        end
+    end
+    text = text:gsub("^%s*what is%s+", ""):gsub("^%s*whats%s+", ""):gsub("^%s*how much is%s+", ""):gsub("^%s*calculate%s+", "")
+    local a, op, b = text:match("^%s*([%-+]?%d+%.?%d*)%s*([+*/%%%^%-])%s*([%-+]?%d+%.?%d*)%s*$")
+    a, b = tonumber(a), tonumber(b)
+    if not a or not b or math.abs(a) > 1e9 or math.abs(b) > 1e9 then return nil end
+    local value
+    if (op == "/" or op == "%") and b == 0 then return "undefined" end
+    if op == "+" then value = a + b
+    elseif op == "-" then value = a - b
+    elseif op == "*" then value = a * b
+    elseif op == "/" then value = a / b
+    elseif op == "%" then value = a % b
+    elseif op == "^" and math.abs(b) <= 12 then value = a ^ b end
+    if not value or value ~= value or math.abs(value) == math.huge then return nil end
+    return math.abs(value) < 100000 and tostring(value) or string.format("%.4g", value)
+end
+
+local Facts = {
+    { "capital of japan", 22 }, { "capital of france", 23 },
+    { "capital of vietnam", 24 }, { "capital of australia", 25 },
+    { "capital of canada", 26 }, { "why is the sky blue", 33 },
+    { "why sky blue", 33 }, { "how many hearts do octopuses", 1 },
+    { "how many legs do spiders", 13 }, { "how many legs do insects", 14 },
+    { "how many sides does a triangle", 27 }, { "how many sides does a hexagon", 28 },
+    { "how many minutes in an hour", 30 }, { "largest planet", 18 },
+    { "largest ocean", 21 }, { "what is the sun", 5 }, { "what is an echo", 35 },
+}
+
+local FollowSigns = {
+    positive = { "yes", "yeah", "yep", "sure", "good", "fine", "great", "nice", "bet", "ok", "okay", "lol", "haha" },
+    negative = { "no", "nah", "nope", "bad", "not really", "not yet", "dont know", "idk" },
+    deeper = { "why", "how", "what do you mean", "explain", "tell me more" },
+}
+
+function Engine:plan(item, owner)
+    local text, speaker = item.clean, item.speaker
+    local values = {
+        username = safeName(owner.name), display = safeName(owner.display),
+        speaker = safeName(speaker and speaker.name), speakerdisplay = safeName(speaker and speaker.display),
+    }
+    local names = self.Topics.account_name
+    for _, alias in ipairs({ "tom", "tommy", normalize(owner.name), normalize(owner.display) }) do
+        if alias ~= "" and text == alias then return self.Topics.greet, values, nil, 1 end
+    end
+    -- Name questions are explicit, so a nickname answer never replaces a
+    -- requested account username/display name or the other player's own name.
+    if contains(text, "my name") or contains(text, "my username") or contains(text, "my display name") then
+        if contains(text, "what") or contains(text, "whats") or contains(text, "remember") or contains(text, "know") then
+            return names, values, { contains(text, "display") and 12 or 4 }, 1
+        end
+    end
+    if contains(text, "real name") or contains(text, "personal name") then return names, values, { 18 }, 1 end
+    if contains(text, "how old are you") or contains(text, "how old r u") or contains(text, "your age") then
+        return self.Topics.chatbot_identity, values, { 30 }, 1
+    end
+    if contains(text, "where do you live") or contains(text, "where are you from") or contains(text, "where r u from") then
+        return self.Topics.chatbot_identity, values, { 29 }, 1
+    end
+    if contains(text, "your username") or contains(text, "ur username") or contains(text, "your account")
+        or (contains(text, "username") and self:addressed(text, owner)) then
+        return names, values, { 5, 7, 8, 13, 16, 21, 24, 26, 30, 36, 40, 44, 48 }, 1
+    end
+    if contains(text, "your display name") or contains(text, "ur display name")
+        or (contains(text, "display name") and self:addressed(text, owner)) then
+        return names, values, { 6, 9, 14, 17, 22, 27, 31, 37, 41, 45, 49 }, 1
+    end
+    local answer = self:mathAnswer(item.raw, owner)
+    if answer then values.answer = answer; return self.Topics.knowledge, values, { 45, 46, 47, 48, 49, 50 }, 1 end
+    for _, fact in ipairs(Facts) do
+        if contains(text, fact[1]) then return self.Topics.knowledge, values, { fact[2] }, 1 end
+    end
+    local session = speaker and self.Sessions[speaker.id]
+    if session and self.Clock() - session.at <= self.Config.FollowWindow and session.phase < 4 then
+        for kind, phrases in pairs(FollowSigns) do
+            for _, phrase in ipairs(phrases) do
+                if text == phrase then
+                    local topic = self.Topics[session.tag]
+                    if topic and topic.tag ~= "knowledge" and topic.tag ~= "account_name" then
+                        -- Continue the same person's topic, not another user's.
+                        -- Restrict short followups to responses rather than
+                        -- repeatedly throwing unrelated initial questions back.
+                        local pool = {}
+                        for index, reply in ipairs(topic.replies) do
+                            local question = reply:sub(-1) == "?"
+                            if not question then
+                                pool[#pool + 1] = index
+                            end
+                        end
+                        return topic, values, pool, session.phase + 1
+                    end
+                end
+            end
+        end
+    end
+    local topic = self:topicFor(text) or self.Topics.clarify
+    if topic == names then
+        return topic, values, { 1, 2, 3, 10, 11, 15, 19, 20, 23, 25, 28, 32, 33, 34, 35, 38, 39, 42, 43, 46, 50 }, 1
+    end
+    if topic.tag == "knowledge" then
+        local pool = {}
+        for i = 1, 44 do pool[#pool + 1] = i end
+        return topic, values, pool, 1
+    end
+    if topic.tag == "story" then
+        local pool, requested = {}, contains(text, "tell me a story") or text == "story"
+        for i = requested and 1 or 26, requested and 25 or 50 do pool[#pool + 1] = i end
+        return topic, values, pool, 1
+    end
+    return topic, values, nil, 1
+end
+
+function Engine:render(template, values)
+    local missing = false
+    local text = template:gsub("{(%w+)}", function(key)
+        local value = values[key]
+        if not value or value == "" then missing = true; return "" end
+        return value
+    end)
+    -- Public account identifiers can legitimately contain six digits or
+    -- non-English characters. Validate the prose separately from trusted
+    -- names read directly from Player, rather than silently hiding the name.
+    local prose = template:gsub("{(%w+)}", function(key)
+        if key == "username" or key == "display" or key == "speaker" or key == "speakerdisplay" then return "player" end
+        return values[key] or ""
+    end)
+    return not missing and #text <= 190 and validReply(prose) and text or nil
+end
+
+function Engine:pick(topic, values, pool)
+    local used, fresh, reusable = self.Used[topic.tag] or {}, {}, {}
+    self.Used[topic.tag] = used
+    local indices = pool
+    if not indices then indices = {}; for i = 1, #topic.replies do indices[#indices + 1] = i end end
+    for _, index in ipairs(indices) do
+        local text = self:render(topic.replies[index], values)
+        if text and not self.RecentSet[text] then
+            local candidate = { text = text, index = index, tag = topic.tag }
+            reusable[#reusable + 1] = candidate
+            if not used[index] then fresh[#fresh + 1] = candidate end
+        end
+    end
+    if #fresh == 0 and #reusable > 0 then
+        -- Only this semantic pool resets, never another topic's history.
+        for _, entry in ipairs(reusable) do used[entry.index] = nil end
+        fresh = reusable
+    end
+    if #fresh > 0 then return fresh[self.Random(1, #fresh)] end
+    -- A one-line fact/name answer can be exhausted by repetition. Ask for
+    -- clarification instead of substituting a different fact or staying silent.
+    if topic.tag ~= "clarify" then return self:pick(self.Topics.clarify, {}, nil) end
+    return nil
+end
+
+function Engine:prepare(owner)
+    local now = self.Clock()
+    if self.Destroyed or not self.Enabled or self.Sending or now < self.NextSend then return nil end
+    local item = self.Pending
+    if item and (item.epoch ~= self.Epoch or now - item.at > self.Config.StaleAfter) then
+        self.Pending = nil; self.DroppedCount += 1; item = nil
+    end
+    if not item then
+        if not self.Config.AllowIdleOpeners or now - self.LastInbound < self.Config.IdleOpenerAfter
+            or now - self.LastOutbound < self.Config.IdleOpenerAfter then return nil end
+        item = { clean = "im bored", raw = "im bored", at = now, readyAt = now,
+            priority = -1, epoch = self.Epoch, attempts = 0, opener = true }
+    end
+    if now < item.readyAt then return nil end
+    local topic, values, pool, phase = self:plan(item, owner)
+    local choice = self:pick(topic, values, pool)
+    if not choice then return nil end
+    if choice.tag ~= topic.tag then topic, phase = self.Topics[choice.tag], 1 end
+    if self.Pending == item then self.Pending = nil end
+    self.Sending = true
+    return { item = item, topic = topic, choice = choice, phase = phase, epoch = self.Epoch }
+end
+
+function Engine:finish(job, success, reason)
+    self.Sending = false
+    local now = self.Clock()
+    if success then
+        self.LastOutbound, self.LastError = now, nil
+        self.NextSend = now + self.Config.MinGap + self.Random() * (self.Config.MaxGap - self.Config.MinGap)
+        self.SentCount += 1
+        local text = job.choice.text
+        self.Used[job.topic.tag] = self.Used[job.topic.tag] or {}
+        self.Used[job.topic.tag][job.choice.index] = true
+        self.Recent[#self.Recent + 1], self.RecentSet[text] = text, true
+        while #self.Recent > self.Config.RecentBlock do self.RecentSet[table.remove(self.Recent, 1)] = nil end
+        local speaker = job.item.speaker
+        if not self.Destroyed and self.Enabled and self.Epoch == job.epoch and speaker then
+            self.Sessions[speaker.id] = { tag = job.topic.tag, at = now, phase = job.phase }
+        end
+    else
+        self.FailedCount += 1
+        self.LastError, self.NextSend = tostring(reason or "chat unavailable"), now + self.Config.MinGap
+        if not self.Destroyed and self.Enabled and job.epoch == self.Epoch and not self.Pending
+            and job.item.attempts < 1 and now - job.item.at < self.Config.StaleAfter then
+            job.item.attempts += 1
+            job.item.readyAt = self.NextSend
+            self.Pending = job.item
+        end
+    end
+end
+
+function Engine:prune()
+    local now, count, oldest, oldestAt = self.Clock(), 0, nil, math.huge
+    for id, session in pairs(self.Sessions) do
+        if now - session.at > self.Config.FollowWindow then self.Sessions[id] = nil
+        else
+            count += 1
+            if session.at < oldestAt then oldest, oldestAt = id, session.at end
+        end
+    end
+    if count > self.Config.MaxSessions and oldest then self.Sessions[oldest] = nil end
+    for key, entry in pairs(self.Seen) do if now - entry.at > 15 then self.Seen[key] = nil end end
+    for id, at in pairs(self.MessageIds) do if now - at > 15 then self.MessageIds[id] = nil end end
+end
+
+-- ROBLOX_CLIENT_BOOTSTRAP
+local Players = game:GetService("Players")
+local UserInputService = game:GetService("UserInputService")
+local TextChatService = game:GetService("TextChatService")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local LocalPlayer = Players.LocalPlayer
+if not LocalPlayer then error("Tom Player must run in a Roblox client", 0) end
+
+local environment = type(getgenv) == "function" and getgenv() or _G
+local old = environment.TomPlayerChat
+local previousNext, previousSent = 0, -math.huge
+if type(old) == "table" then
+    previousNext = tonumber(old.NextSendAt) or 0
+    previousSent = tonumber(old.LastSentAt) or -math.huge
+    if type(old.Destroy) == "function" then pcall(old.Destroy) end
+end
+
+local bot = Engine.new(Config)
+-- Re-execution must not bypass the same client's send cooldown.
+bot.NextSend = math.max(0, math.min(previousNext, os.clock() + Config.MaxGap))
+bot.LastOutbound = math.min(previousSent, os.clock())
+local state = { Destroyed = false, Connections = {}, PlayerConnections = {}, ClickTicket = 0, LastClick = -math.huge }
+environment.TomPlayerChat = state
+
+local gui = Instance.new("ScreenGui")
+gui.Name = "TomStandalonePlayer"
+gui.ResetOnSpawn = false
+gui.IgnoreGuiInset = false
+gui.DisplayOrder = 1000
+gui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+local button = Instance.new("TextButton")
+button.Name = "ToggleX"
+button.AnchorPoint = Vector2.new(1, 0)
+button.Position = UDim2.new(1, -10, 0, 8)
+button.Size = UDim2.fromOffset(28, 28)
+button.BackgroundColor3 = Color3.fromRGB(20, 23, 28)
+button.BackgroundTransparency = 0.15
+button.BorderSizePixel = 0
+button.Text = "X"
+button.Font = Enum.Font.GothamBold
+button.TextSize = 18
+button.AutoButtonColor = false
+button.Parent = gui
+local corner = Instance.new("UICorner")
+corner.CornerRadius = UDim.new(0, 7)
+corner.Parent = button
+local stroke = Instance.new("UIStroke")
+stroke.Thickness = 1.2
+stroke.ApplyStrokeMode = Enum.ApplyStrokeMode.Border
+stroke.Parent = button
+
+local function repaint()
+    local color = bot.Enabled and Color3.fromRGB(70, 230, 110) or Color3.fromRGB(255, 85, 85)
+    button.TextColor3, stroke.Color = color, color
+    button:SetAttribute("Enabled", bot.Enabled)
+    button:SetAttribute("LastError", bot.LastError)
+end
+
+local function connect(signal, callback)
+    local connection = signal:Connect(callback)
+    state.Connections[#state.Connections + 1] = connection
+    return connection
+end
+
+function state.SetEnabled(value)
+    if state.Destroyed then return end
+    state.ClickTicket += 1
+    state.LastClick = -math.huge
+    bot:setEnabled(value)
+    repaint()
+end
+
+function state.Destroy()
+    if state.Destroyed then return end
+    state.Destroyed = true
+    state.ClickTicket += 1
+    bot:destroy()
+    if state.Worker and type(task.cancel) == "function" and coroutine.running() ~= state.Worker then
+        pcall(task.cancel, state.Worker)
+    end
+    for _, connection in ipairs(state.Connections) do pcall(function() connection:Disconnect() end) end
+    for _, connection in pairs(state.PlayerConnections) do pcall(function() connection:Disconnect() end) end
+    table.clear(state.Connections)
+    table.clear(state.PlayerConnections)
+    if environment.TomPlayerChat == state then environment.TomPlayerChat = nil end
+    gui:Destroy()
+end
+
+local parent
+pcall(function() if type(gethui) == "function" then parent = gethui() end end)
+if not parent then parent = game:GetService("CoreGui") end
+local parented = pcall(function() gui.Parent = parent end)
+if not parented then
+    local playerGui = LocalPlayer:FindFirstChildOfClass("PlayerGui") or LocalPlayer:WaitForChild("PlayerGui", 5)
+    if not playerGui then state.Destroy(); error("Tom Player could not find PlayerGui", 0) end
+    gui.Parent = playerGui
+end
+
+connect(button.Activated, function()
+    if state.Destroyed then return end
+    local now = os.clock()
+    if now - state.LastClick <= Config.DoubleClickWindow then state.Destroy(); return end
+    state.LastClick = now
+    state.ClickTicket += 1
+    local ticket = state.ClickTicket
+    task.delay(Config.DoubleClickWindow, function()
+        if not state.Destroyed and state.ClickTicket == ticket then state.SetEnabled(not bot.Enabled) end
+    end)
+end)
+
+connect(UserInputService.InputBegan, function(input, processed)
+    if state.Destroyed or processed or UserInputService:GetFocusedTextBox() then return end
+    if input.KeyCode == Enum.KeyCode.Equals then state.SetEnabled(not bot.Enabled) end
+end)
+connect(gui.Destroying, function() state.Destroy() end)
+
+local function ownerInfo()
+    return { id = LocalPlayer.UserId, name = LocalPlayer.Name, display = LocalPlayer.DisplayName or LocalPlayer.Name }
+end
+
+local function publicChannel(channel)
+    if not channel or not channel:IsA("TextChannel") then return false end
+    local name = channel.Name:lower()
+    return not name:find("whisper", 1, true) and not name:find("team", 1, true) and not name:find("system", 1, true)
+end
+
+local function receive(player, text, feed, messageId)
+    if state.Destroyed or not player or player.Parent ~= Players then return end
+    bot:receive({ id = player.UserId, name = player.Name, display = player.DisplayName or player.Name },
+        text, feed, messageId, ownerInfo())
+end
+
+local function hookPlayer(player)
+    if state.PlayerConnections[player] then return end
+    state.PlayerConnections[player] = player.Chatted:Connect(function(text, recipient)
+        -- Never echo a private whisper into public chat.
+        if recipient ~= nil then return end
+        if TextChatService.ChatVersion == Enum.ChatVersion.TextChatService then return end
+        receive(player, text, "legacy")
+    end)
+end
+for _, player in ipairs(Players:GetPlayers()) do hookPlayer(player) end
+connect(Players.PlayerAdded, hookPlayer)
+connect(Players.PlayerRemoving, function(player)
+    local connection = state.PlayerConnections[player]
+    if connection then connection:Disconnect(); state.PlayerConnections[player] = nil end
+    bot.Sessions[player.UserId] = nil
+    if bot.Pending and bot.Pending.speaker and bot.Pending.speaker.id == player.UserId then bot.Pending = nil end
+end)
+
+connect(TextChatService.MessageReceived, function(message)
+    if TextChatService.ChatVersion ~= Enum.ChatVersion.TextChatService or not message.TextSource then return end
+    if not publicChannel(message.TextChannel) then return end
+    local player = Players:GetPlayerByUserId(message.TextSource.UserId)
+    receive(player, message.Text, "modern", message.MessageId)
+end)
+
+local function send(text)
+    if state.Destroyed or not bot.Enabled then return false, "bot paused" end
+    if TextChatService.ChatVersion == Enum.ChatVersion.TextChatService then
+        local channels = TextChatService:FindFirstChild("TextChannels")
+        local channel = channels and channels:FindFirstChild("RBXGeneral")
+        if not publicChannel(channel) then
+            local config = TextChatService:FindFirstChild("ChatInputBarConfiguration")
+            channel = config and config.TargetTextChannel
+        end
+        if not publicChannel(channel) then return false, "public chat channel unavailable" end
+        local ok, result = pcall(function() return channel:SendAsync(text) end)
+        if not ok then return false, tostring(result) end
+        if result and result.Status and result.Status ~= Enum.TextChatMessageStatus.Success then
+            return false, "Roblox chat did not accept the message"
+        end
+        return true
+    end
+    local events = ReplicatedStorage:FindFirstChild("DefaultChatSystemChatEvents")
+    local remote = events and events:FindFirstChild("SayMessageRequest")
+    if not remote then return false, "legacy public chat unavailable" end
+    local ok, reason = pcall(function() remote:FireServer(text, "All") end)
+    return ok, ok and nil or tostring(reason)
+end
+
+state.SetEnabled(Config.StartEnabled)
+state.Worker = task.spawn(function()
+    local nextPrune, lastWarning = 0, -math.huge
+    while not state.Destroyed do
+        local now = os.clock()
+        if now >= nextPrune then bot:prune(); nextPrune = now + 2 end
+        local job = bot:prepare(ownerInfo())
+        if job then
+            local success, reason = send(job.choice.text)
+            bot:finish(job, success, reason)
+            state.NextSendAt, state.LastSentAt = bot.NextSend, bot.LastOutbound
+            if not state.Destroyed then
+                repaint()
+                if not success and now - lastWarning >= 30 then
+                    lastWarning = now
+                    warn("[Tom Player] " .. tostring(reason))
+                end
+            end
+        end
+        task.wait(bot.Enabled and 0.1 or 0.25)
+    end
+end)
