@@ -1,0 +1,10 @@
+{
+  "name": "tom-player-api",
+  "private": true,
+  "type": "module",
+  "engines": { "node": ">=22" },
+  "scripts": {
+    "build": "node build.mjs",
+    "test": "node build.mjs && node --test worker.test.mjs"
+  }
+}

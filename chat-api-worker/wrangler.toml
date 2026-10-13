@@ -1,0 +1,16 @@
+name = "tom-player-api"
+main = "deploy.js"
+compatibility_date = "2026-10-13"
+
+[vars]
+PROVIDER_ORDER = "groq,cerebras,gemini,cloudflare,github,huggingface,openrouter"
+BUDGET_MS = "8800"
+ATTEMPT_MS = "2700"
+GEMINI_MODEL = "gemini-2.5-flash-lite"
+GROQ_MODEL = "openai/gpt-oss-20b"
+CEREBRAS_MODEL = "gpt-oss-120b"
+CLOUDFLARE_MODEL = "@cf/meta/llama-3.1-8b-instruct"
+GITHUB_MODEL = "openai/gpt-4o-mini"
+OPENROUTER_MODEL = "openrouter/free"
+# Set HF_MODEL to a chat model currently available to your Inference Providers account.
+# API keys and BOT_TOKEN belong in Worker Secrets, never here.
