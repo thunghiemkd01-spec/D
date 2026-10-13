@@ -18,6 +18,26 @@ const keyNames = {
 const baseInput = { requestId: 'test-1', message: 'hello tom',
   account: { username: 'ActualUser123456', displayName: 'Actual Nick' },
   speaker: { username: 'Guest', displayName: 'Guest Name' }, history: [], recent: [] };
+
+test('diagnostics distinguish transport, JSON, style and repetition without exposing secrets', async () => {
+  const cases = [
+    ['network_error', async () => { throw new Error('private-key-value'); }],
+    ['invalid_json', async () => new Response('not JSON')],
+    ['reply_rejected', async () => response('groq', 'a reply with https://example.com')],
+    ['repeated_reply', async () => response('groq', 'yo')],
+    ['http_401', async () => new Response('private-key-value', { status: 401 })],
+  ];
+  for (const [expected, fetch] of cases) {
+    const worker = createWorker({ fetch });
+    const result = await worker.fetch(request({ ...baseInput, recent: ['yo'] }), {
+      BOT_TOKEN: ACCESS, GROQ_API_KEY: 'private-key-value',
+    });
+    const body = await result.json();
+    assert.equal(result.status, 503);
+    assert.equal(body.attempts[0].error, expected);
+    assert.ok(!JSON.stringify(body).includes('private-key-value'));
+  }
+});
 function request(input = baseInput, token = ACCESS) {
   return new Request('https://bridge.test/chat', { method: 'POST',
     headers: { authorization: `Bearer ${token}`, 'content-type': 'application/json' }, body: JSON.stringify(input) });

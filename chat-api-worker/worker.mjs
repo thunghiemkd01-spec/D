@@ -182,16 +182,24 @@ export function createWorker(dependencies = {}) {
           const aborted = new Promise((_, reject) => controller.signal.addEventListener('abort', () => reject(new Error('attempt_aborted')), { once: true }));
           const network = (async () => {
             const { url, options } = requestFor(provider, env, messages, controller.signal);
-            const response = await fetcher(url, options);
+            let response;
+            try { response = await fetcher(url, options); }
+            catch (error) {
+              if (controller.signal.aborted) throw error;
+              throw new Error('network_error');
+            }
             if (!response.ok) {
               const seconds = Number(response.headers.get('retry-after'));
               const retry = Number.isFinite(seconds) && seconds > 0 ? Math.min(seconds * 1000, 86400000) : 60000;
               failures.set(`${provider.name}:${provider.model}`, clock() + ((response.status === 401 || response.status === 403 || response.status === 404) ? 300000 : response.status === 429 ? retry : 10000));
               throw new Error(`http_${response.status}`);
             }
-            const data = await response.json();
+            let data;
+            try { data = await response.json(); }
+            catch { throw new Error('invalid_json'); }
             const text = cleanReply(textFrom(provider, data), input.account);
-            if (!text || recent.includes(text)) throw new Error('invalid_or_repeated_reply');
+            if (!text) throw new Error('reply_rejected');
+            if (recent.includes(text)) throw new Error('repeated_reply');
             return text;
           })();
           Promise.race([network, aborted]).then(text => {
@@ -202,7 +210,9 @@ export function createWorker(dependencies = {}) {
             }
           }).catch(error => {
             if (settled) return;
-            const code = timedOut ? 'timeout' : /^http_\d+$/.test(error.message) ? error.message : 'provider_unavailable';
+            const known = /^(http_\d+|network_error|invalid_json|reply_rejected|repeated_reply|invalid_cloudflare_account|invalid_cloudflare_model)$/;
+            const code = timedOut ? 'timeout' : known.test(error.message) ? error.message
+              : error instanceof TypeError ? 'internal_type_error' : 'provider_unavailable';
             attempts.push({ provider: provider.name, error: code });
             if ((failures.get(`${provider.name}:${provider.model}`) || 0) <= clock()) failures.set(`${provider.name}:${provider.model}`, clock() + (timedOut ? 10000 : 5000));
           }).finally(() => {
