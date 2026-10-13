@@ -142,7 +142,8 @@ function textFrom(provider, data) {
 }
 
 function createWorker(dependencies = {}) {
-  const fetcher = dependencies.fetch || fetch;
+  // Workers' native fetch can require its global receiver. Do not detach it.
+  const fetcher = dependencies.fetch || ((...args) => globalThis.fetch(...args));
   const clock = dependencies.now || Date.now;
   const timer = dependencies.setTimeout || setTimeout;
   const untimer = dependencies.clearTimeout || clearTimeout;
@@ -189,7 +190,13 @@ function createWorker(dependencies = {}) {
             try { response = await fetcher(url, options); }
             catch (error) {
               if (controller.signal.aborted) throw error;
-              throw new Error('network_error');
+              // Report categories only: upstream error messages can contain secrets.
+              const message = String(error?.message || '');
+              throw new Error(/illegal invocation|incorrect.*this|receiver/i.test(message)
+                ? 'fetch_invocation_error' : /dns|resolve|name resolution/i.test(message)
+                  ? 'network_dns_error' : /certificate|tls|ssl/i.test(message)
+                    ? 'network_tls_error' : /too many subrequests/i.test(message)
+                      ? 'network_subrequest_limit' : 'network_error');
             }
             if (!response.ok) {
               const seconds = Number(response.headers.get('retry-after'));
@@ -213,7 +220,7 @@ function createWorker(dependencies = {}) {
             }
           }).catch(error => {
             if (settled) return;
-            const known = /^(http_\d+|network_error|invalid_json|reply_rejected|repeated_reply|invalid_cloudflare_account|invalid_cloudflare_model)$/;
+            const known = /^(http_\d+|fetch_invocation_error|network_error|network_dns_error|network_tls_error|network_subrequest_limit|invalid_json|reply_rejected|repeated_reply|invalid_cloudflare_account|invalid_cloudflare_model)$/;
             const code = timedOut ? 'timeout' : known.test(error.message) ? error.message
               : error instanceof TypeError ? 'internal_type_error' : 'provider_unavailable';
             attempts.push({ provider: provider.name, error: code });

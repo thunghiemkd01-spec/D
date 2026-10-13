@@ -22,6 +22,9 @@ const baseInput = { requestId: 'test-1', message: 'hello tom',
 test('diagnostics distinguish transport, JSON, style and repetition without exposing secrets', async () => {
   const cases = [
     ['network_error', async () => { throw new Error('private-key-value'); }],
+    ['fetch_invocation_error', async () => { throw new TypeError('Illegal invocation'); }],
+    ['network_dns_error', async () => { throw new Error('DNS resolution failed'); }],
+    ['network_tls_error', async () => { throw new Error('TLS certificate failed'); }],
     ['invalid_json', async () => new Response('not JSON')],
     ['reply_rejected', async () => response('groq', 'a reply with https://example.com')],
     ['repeated_reply', async () => response('groq', 'yo')],
@@ -37,6 +40,20 @@ test('diagnostics distinguish transport, JSON, style and repetition without expo
     assert.equal(body.attempts[0].error, expected);
     assert.ok(!JSON.stringify(body).includes('private-key-value'));
   }
+});
+
+test('native fetch keeps the global receiver required by Workers', async () => {
+  const original = globalThis.fetch;
+  try {
+    globalThis.fetch = async function () {
+      assert.equal(this, globalThis);
+      return response('groq', 'hey there');
+    };
+    const worker = createWorker();
+    const result = await worker.fetch(request(), { BOT_TOKEN: ACCESS, GROQ_API_KEY: 'mock_groq' });
+    assert.equal(result.status, 200);
+    assert.equal((await result.json()).reply, 'hey there');
+  } finally { globalThis.fetch = original; }
 });
 function request(input = baseInput, token = ACCESS) {
   return new Request('https://bridge.test/chat', { method: 'POST',
